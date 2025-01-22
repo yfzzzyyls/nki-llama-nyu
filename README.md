@@ -1,4 +1,4 @@
-# OPTNKI
+# NKI Llama
 
 ## Getting Started
 
@@ -18,7 +18,7 @@ To learn NKI, follow [the official NKI guide](https://awsdocs-neuron.readthedocs
     5. **Metadata version [under “Advanced details”]:** V2 only (otherwise, you will encounter a not authorized error)
     6. When connecting to these instances via SSH, use the username of *ubuntu*.
 2. Activate the Neuron virtual environment to run inference by running `source /opt/aws_neuronx_venv_pytorch_2_5_nxd_inference/bin/activate`.
-3. Clone this repository and run `cd [PATH]/OPTNKI` where `[PATH]` is the directory where you have performed the clone.
+3. Clone this repository and run `cd [PATH]/nki-llama` where `[PATH]` is the directory where you have performed the clone.
 4. Download the [Llama3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) model to a `~/models` folder in your root directory. We recommend doing so using the [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli). You can install this by running `pip3 install huggingface_hub[cli]`. You will also need to create an [access token](https://huggingface.co/docs/hub/en/security-tokens). 
 To download the models, run the following:
     ```
@@ -27,7 +27,7 @@ To download the models, run the following:
     huggingface-cli download --token YOURTOKEN meta-llama/Llama-3.2-1B --local-dir /home/ubuntu/models/llama-3.2-1b
     ```
 5. [Llama3.2-1B Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) may be more fun to chat with. You can download and use this model as well.
-6. To run inference, navigate to `[PATH]/OPTNKI` and run `python main.py --mode generate`.
+6. To run inference, navigate to `[PATH]/nki-llama` and run `python main.py --mode generate`.
 
 ## NKI Kernel Example
 The following steps provide an example of how to utilize NKI kernels in the Llama3.2-1B model:
