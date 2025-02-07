@@ -112,36 +112,37 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, eps):
     # Since we're not reducing across the first dimension
     # Tiles can be processed independently
 
-    for i in range(math.ceil(a_tensor.shape[1]/128)):
-        # Load input data from external memory to on-chip memory
-        a_tile = nl.zeros([128, a_tensor.shape[2]], a_tensor.dtype)
-        a_tile[...] = nl.load(a_tensor[0, i * 128 + ix, iy], mask=(i * 128 + ix < num_rows))
+    for b in range(a_tensor.shape[0]):
+        for i in range(math.ceil(a_tensor.shape[1]/128)):
+            # Load input data from external memory to on-chip memory
+            a_tile = nl.zeros([128, a_tensor.shape[2]], a_tensor.dtype)
+            a_tile[...] = nl.load(a_tensor[b, i * 128 + ix, iy], mask=(i * 128 + ix < num_rows))
 
-        # Compute element-wise square of a_tensor
-        in_square = nl.square(a_tile)
+            # Compute element-wise square of a_tensor
+            in_square = nl.square(a_tile)
 
-        # Calculate sum of squared elements, along last dimension
-        square_sum = nl.sum(in_square, axis=[1])
+            # Calculate sum of squared elements, along last dimension
+            square_sum = nl.sum(in_square, axis=[1])
 
-        # Scale and get a reciprocal
-        mean = square_sum / a_tensor.shape[2]
+            # Scale and get a reciprocal
+            mean = square_sum / a_tensor.shape[2]
 
-        # Take square root of mean and then reciprocal with
-        # rsqrt API (one ISA instruction)
-        rms_reciprocal = nl.rsqrt(mean + eps)
+            # Take square root of mean and then reciprocal with
+            # rsqrt API (one ISA instruction)
+            rms_reciprocal = nl.rsqrt(mean + eps)
 
-        # Scale the input tensor
-        out_tile = nl.multiply(a_tile, rms_reciprocal)
+            # Scale the input tensor
+            out_tile = nl.multiply(a_tile, rms_reciprocal)
 
-        # Broadcast weight along first axis to match tensor shape
-        # num_rows_active = min(num_rows - i * 128, 128)
-        g_bcast = g_tile.broadcast_to((128, g_tensor.shape[0]))
+            # Broadcast weight along first axis to match tensor shape
+            # num_rows_active = min(num_rows - i * 128, 128)
+            g_bcast = g_tile.broadcast_to((128, g_tensor.shape[0]))
 
-        # Multiply with the RMSNorm weight
-        out_tile[...] = nl.multiply(out_tile, g_bcast, mask=(i * 128 + ix < num_rows))
+            # Multiply with the RMSNorm weight
+            out_tile[...] = nl.multiply(out_tile, g_bcast, mask=(i * 128 + ix < num_rows))
 
-        # store the addition results back to external memory (out_tensor)
-        nl.store(out_tensor[0, i * 128 + ix, iy], value=out_tile, mask=(i * 128 + ix < num_rows))
+            # store the addition results back to external memory (out_tensor)
+            nl.store(out_tensor[b, i * 128 + ix, iy], value=out_tile, mask=(i * 128 + ix < num_rows))
 
     return out_tensor
 
