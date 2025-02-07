@@ -46,8 +46,7 @@ def parse_args():
     parser.add_argument("--num-tokens-to-check", type=int)
 
     # Generation
-    parser.add_argument("--prompt", dest="prompts", action="append",
-                        default=["I believe the meaning of life is"])
+    parser.add_argument("--prompt", dest="prompts", action="append")
     parser.add_argument("--top-k", type=int, default=1)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -483,6 +482,8 @@ def calculate_score(accuracy, latency, throughput, nki_flop_ratio):
 
 def main():
     args = parse_args()
+    if not args.prompts:
+        args.prompts = ["I believe the meaning of life is"]
     args.batch_size = len(args.prompts)
     model, tokenizer, generation_config = prepare_inference(NeuronLlamaForCausalLM, args)
 
