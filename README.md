@@ -141,7 +141,7 @@ The following steps provide an example of how to utilize NKI kernels in the Llam
         return CustomRMSNormNKI if parallel_state.model_parallel_is_initialized() else LlamaRMSNorm
     ```
 
-1. Run inference using the NKI kernel and evaluation mode enabled by running `python main.py --enable-nki --mode evaluate`. If you would like to run the model with multiple prompts in addition to the default prompt ("I believe the meaning of life is"), pass in `--prompt [PROMPTS]` where `[PROMPTS]` is a comma-separated list of prompts.
+1. Run inference using the NKI kernel and evaluation mode enabled by running `python main.py --enable-nki --mode evaluate`. If you would like to run the model with specific prompts, pass in `--prompt [PROMPTS]` where `[PROMPTS]` is a comma-separated list of prompts.
 
 ## Additional Tools
 
