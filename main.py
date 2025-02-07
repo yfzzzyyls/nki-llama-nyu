@@ -6,22 +6,24 @@ import copy
 import json
 import os
 import time
+import torch
 
 from torch_neuronx.pyhlo.hlo_pb2 import HloModuleProto
+from torch_neuronx.testing.validation import logit_validation
 from transformers import AutoTokenizer, GenerationConfig
 
 from neuronx_distributed_inference.models.config import OnDeviceSamplingConfig, to_torch_dtype
-from neuronx_distributed_inference.utils.accuracy import (
-    get_generate_outputs,
-    check_accuracy_logits
-)
-from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
-from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
+from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
+from neuronx_distributed_inference.utils.accuracy import get_generate_outputs
+from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config, HuggingFaceGenerationAdapter
 from neuronx_distributed_inference.utils.random import set_random_seed
+
+from neuronx_distributed_inference.utils.benchmark import create_submodule_latency_collectors, register_latency_collectors, generate_report, generate_submodule_reports, Benchmark
 
 # Load the model for ASPLOS contest
 from llama import NeuronLlamaForCausalLM
 
+BENCHMARK_REPORT_FILENAME = "benchmark_report.json"
 set_random_seed(0)
 
 
@@ -44,8 +46,7 @@ def parse_args():
     parser.add_argument("--num-tokens-to-check", type=int)
 
     # Generation
-    parser.add_argument("--prompt", dest="prompts", type=str, action="append",
-                        default="I believe the meaning of life is")
+    parser.add_argument("--prompt", dest="prompts", action="append")
     parser.add_argument("--top-k", type=int, default=1)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -167,6 +168,169 @@ def prepare_inference(model_cls, args):
     return model, tokenizer, generation_config
 
 
+def benchmark_sampling(model, tokenizer, generation_config, prompts):
+    neuron_config = model.neuron_config
+
+    sampling_params = prepare_sampling_params(
+        batch_size=neuron_config.batch_size,
+        top_k=generation_config.top_k
+        if isinstance(generation_config.top_k, list)
+        else [generation_config.top_k],
+        top_p=generation_config.top_p
+        if isinstance(generation_config.top_p, list)
+        else [generation_config.top_p],
+        temperature=generation_config.temperature
+        if isinstance(generation_config.temperature, list)
+        else [generation_config.temperature],
+    )
+
+    report = {}
+
+    # on_device_sampling flow does not support min_new_tokens
+    # to override eos_tokens so we remove EOS tokens to ensure
+    # token generation happens.
+    modified_generation_config = copy.deepcopy(generation_config)
+    if model.on_device_sampling:
+        modified_generation_config.eos_token_id = []
+    
+    inputs = tokenizer(prompts, padding=True, return_tensors="pt")
+    input_ids = inputs.input_ids
+    attention_mask = inputs.attention_mask
+
+    input_param = {
+        "input_ids": input_ids,
+        "generation_config": modified_generation_config,
+        "attention_mask": attention_mask,
+        "max_new_tokens": neuron_config.max_new_tokens,
+        "top_k": 1,
+        "do_sample": not neuron_config.enable_fused_speculation,
+        "sampling_params": sampling_params,
+        "max_length": neuron_config.max_length
+        if neuron_config.max_new_tokens is None
+        else None,
+    }
+
+    latency_collectors = create_submodule_latency_collectors(model)
+
+    def post_warmup_func():
+        register_latency_collectors(latency_collectors, model)
+
+    # Register latency collectors after warm-up to avoid recording warm-up metrics.
+    generation_model = HuggingFaceGenerationAdapter(model)
+    e2e_benchmark = Benchmark(
+        generation_model.generate,
+        input_param,
+        preprocess_func=model.reset,
+        post_warmup_func=post_warmup_func,
+    )
+    e2e_benchmark.run()
+    report["e2e_model"] = generate_report(
+        e2e_benchmark.latency_list,
+        neuron_config.max_length,
+        neuron_config.max_batch_size,
+        n_runs=e2e_benchmark.num_runs,
+    )
+
+    report.update(
+        generate_submodule_reports(
+            latency_collectors, neuron_config, e2e_benchmark.num_runs
+        )
+    )
+    
+    model.reset()
+
+    print("Benchmark completed and its result is as following")
+    print(json.dumps(report, indent=4))
+    with open(BENCHMARK_REPORT_FILENAME, "w") as f:
+        json.dump(report, f)
+    print("Completed saving result to " + BENCHMARK_REPORT_FILENAME)
+
+    return report
+
+
+def check_accuracy_logits(neuron_model, tokenizer, generation_config, prompts, divergence_difference_tol, tol_map, num_tokens_to_check):
+    assert (prompts is not None)
+
+    inputs = tokenizer(prompts, padding=True, return_tensors="pt")
+    initial_input_ids = inputs.input_ids
+    initial_attention_mask = inputs.attention_mask
+    seq_len = neuron_model.config.neuron_config.seq_len
+
+    # Generate goldens with HF on CPU
+    # logit_validation assumes greedy sampling
+    hf_model = neuron_model.load_hf_model(neuron_model.model_path)
+    new_tokens = seq_len - inputs.input_ids.shape[1]
+    outputs = hf_model.generate(
+        inputs.input_ids,
+        max_new_tokens=new_tokens,
+        min_new_tokens=new_tokens,
+        do_sample=False,
+        attention_mask=inputs.attention_mask,
+        return_dict_in_generate=True,
+        output_scores=True,
+        generation_config=generation_config,
+    )
+    expected_logits = torch.stack(outputs.scores)
+
+    if num_tokens_to_check is not None:
+        print(f"Validating logits for first {num_tokens_to_check} tokens")
+        expected_logits = expected_logits[:num_tokens_to_check, :, :]
+
+    expected_token_ids = expected_logits.argmax(dim=2).T
+    expected_tokens = tokenizer.batch_decode(
+        expected_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
+    print("Expected Output: ", expected_tokens, expected_token_ids)
+    print("Expected Logits Shape: ", expected_logits.shape)
+
+    model = HuggingFaceGenerationAdapter(neuron_model)
+    expected_attention_mask = torch.ones(
+        (
+            initial_attention_mask.shape[0],
+            expected_token_ids.shape[1],
+        ),
+        dtype=torch.int32,
+    )
+    extrapolated_attention_mask = torch.cat(
+        (initial_attention_mask, expected_attention_mask), dim=1
+    )
+
+    def generate_fn(input_ids):
+        input_length = input_ids.shape[1]
+        attention_mask = extrapolated_attention_mask[:, :input_length]
+        with torch.inference_mode():
+            model_outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=seq_len - input_length,
+                min_new_tokens=seq_len - input_length,
+                do_sample=False,
+                return_dict_in_generate=True,
+                output_scores=True,
+                generation_config=generation_config,
+            )
+
+        actual_logits = torch.stack(model_outputs.scores)
+        actual_token_ids = actual_logits.argmax(dim=2).T
+        actual_tokens = tokenizer.batch_decode(
+            actual_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        print("Actual Output: ", actual_tokens, actual_token_ids)
+        print("Actual Logits Shape: ", actual_logits.shape)
+        return torch.stack(model_outputs.scores)
+
+    passed, results, status_msg = logit_validation(
+        input_ids=initial_input_ids,
+        generate_fn=generate_fn,
+        expected_logits=expected_logits,
+        tol_map=tol_map,
+        divergence_difference_tol=divergence_difference_tol,
+    )
+    assert passed, status_msg
+
+    print("Passed logits validation")
+
+
 def run_generation(model, tokenizer, prompts, generation_config):
     print("\nGenerating outputs...")
     print(f"Prompts: {prompts}")
@@ -202,8 +366,7 @@ def run_accuracy_check(
             model,
             tokenizer,
             generation_config,
-            prompt=prompt,
-            expected_logits=None,
+            prompts=prompt,
             divergence_difference_tol=divergence_difference_tol,
             tol_map=tol_map,
             num_tokens_to_check=num_tokens_to_check,
@@ -305,8 +468,8 @@ def count_nki_flop_ratio(
 def calculate_score(accuracy, latency, throughput, nki_flop_ratio):
 
     # latency and throughput
-    LATENCY_BASE = 295.20
-    THROUGHPUT_BASE = 217.95
+    LATENCY_BASE = 255.51
+    THROUGHPUT_BASE = 260.33
 
     increased_throughput = throughput / THROUGHPUT_BASE
     reduced_latency = LATENCY_BASE / latency
@@ -319,6 +482,9 @@ def calculate_score(accuracy, latency, throughput, nki_flop_ratio):
 
 def main():
     args = parse_args()
+    if not args.prompts:
+        args.prompts = ["I believe the meaning of life is"]
+    args.batch_size = len(args.prompts)
     model, tokenizer, generation_config = prepare_inference(NeuronLlamaForCausalLM, args)
 
     if args.mode == "generate":
@@ -335,7 +501,7 @@ def main():
             model,
             tokenizer,
             generation_config,
-            args.prompts[0],
+            args.prompts,
             args.divergence_difference_tol,
             args.tol_map,
             num_tokens_to_check=args.num_tokens_to_check,
@@ -350,13 +516,13 @@ def main():
             model,
             tokenizer,
             generation_config,
-            args.prompts[0],
+            args.prompts,
             args.divergence_difference_tol,
             args.tol_map,
             num_tokens_to_check=args.num_tokens_to_check,
         )
 
-        report = benchmark_sampling(model, None, generation_config)
+        report = benchmark_sampling(model, tokenizer, generation_config, args.prompts)
 
         latency = report["e2e_model"]["latency_ms_p99"]
         throughput = report["e2e_model"]["throughput"]
