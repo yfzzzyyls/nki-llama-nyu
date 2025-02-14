@@ -154,7 +154,7 @@ Your submission should be a single Python file called `llama.py`. This file shou
 
 ## Benchmarks
 
-Submissions will be tested using 25 benchmarks (prompts) with varying context lengths (TBD, but likely 1K \-\> 128K) and batch sizes (TBD, but likely 1-\>4); five will be released in advance to contest participants (for testing purposes), and the remaining twenty will be withheld for evaluation.
+Submissions will be tested using 25 benchmarks (prompts) with varying context lengths (TBD, but likely 1K \-\> 128K) and batch sizes (TBD, but likely 1-\>4). We have provided 5 prompts in `prompts.txt`. The remaining 20 will be withheld for evaluation.
 
 All benchmarks will become publicly available after the contest is complete.
 
@@ -165,7 +165,7 @@ The contest organizers will execute each team's submission across the twenty wit
 1) Accuracy of generated output vs. our reference implementation. Accuracy evaluation will be a binary assessor: Any benchmark that fails an accuracy threshold will result in a score of 0\.   
 2) Latency (Time to first token (TTFT))  
 3) Throughput measured as output tokens / second  
-4) Amount of model written in NKI (measured as NKI FLOPS / total model FLOPS) (will be applied as a scaling factor for (b) and (c).
+4) Amount of model written in NKI (measured as NKI FLOPS / total model FLOPS) (will be applied as a scaling factor for (b) and (c)). Note: NKI FLOPs measures the number of multiply-accumulate (MAC) operations.
 
 Rankings will be established by calculating the total normalized number of points per team, where points are normalized against the best submitted solution.
 
