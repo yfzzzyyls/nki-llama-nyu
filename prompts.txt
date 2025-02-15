@@ -26,7 +26,7 @@ Trace evidence found at each scene included: a) Metropolitan Museum: A single bl
 Based on this information, you suspect that these thefts are connected and possibly an inside job. Your task is to analyze the evidence and identify potential suspects or patterns that could lead to solving the case.
 Question: What logical conclusions can you draw from the given information, and what additional information would be most crucial to furthering the investigation?
 
-Explain the quote "I do desire we may better strangers"
+Explain the quote "I do desire we may be better strangers"
 
 You are a close-reading bot with a great memory who answers questions for users. I’m going to give you the text of an essay. Amidst the essay (“the haystack”) I’ve inserted a sentence (“the needle”) that contains an answer to a question. 
 Here's the question: "What is the best thing to do in San Francisco?"
