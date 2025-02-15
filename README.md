@@ -152,6 +152,8 @@ The following steps provide an example of how to utilize NKI kernels in the Llam
 
 Your submission should be a single Python file called `llama.py`. This file should contain implementations of NKI kernels and also modifications to the original model to invoke these NKI kernels. This file should work as a plug-in replacement for the original `llama.py` of the reference PyTorch implementation provided in this repository.
 
+Make your submission here: https://forms.gle/zZKKS6RzKcerf4vH8
+
 ## Benchmarks
 
 Submissions will be tested using 25 benchmarks (prompts) with varying context lengths (TBD, but likely 1K \-\> 128K) and batch sizes (TBD, but likely 1-\>4). We have provided 5 prompts in `prompts.txt`. The remaining 20 will be withheld for evaluation.
