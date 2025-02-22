@@ -1,3 +1,5 @@
+# This is the repo for NYU NKI-llama contest
+
 # NKI Llama
 
 ## Getting Started
