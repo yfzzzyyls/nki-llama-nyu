@@ -81,9 +81,116 @@ from torch_neuronx.xla_impl.ops import RmsNorm
 import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
 
+import time
+
+SIMPLE_PROFILE = True
+
 _LLAMA_MODULE_MAP = {}
 
 logger = logging.getLogger("Neuron")
+
+@nki.jit
+def nki_matmul_fully_optimized(
+    lhsT,
+    rhs,
+    TILES_IN_BLOCK_M=16,
+    TILES_IN_BLOCK_N=2,
+    TILES_IN_BLOCK_K=8,
+):
+    K, M = lhsT.shape
+    K_, N = rhs.shape
+    assert K == K_, "lhsT and rhs must have the same contraction dimension"
+    result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+
+    TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
+    TILE_K = nl.tile_size.pmax  # 128
+    TILE_N = nl.tile_size.gemm_moving_fmax  # 512
+
+    BLOCK_M = TILE_M * TILES_IN_BLOCK_M
+    BLOCK_N = TILE_N * TILES_IN_BLOCK_N
+    BLOCK_K = TILE_K * TILES_IN_BLOCK_K
+
+    # the size has to be multiple of block size
+    assert M % BLOCK_M == 0
+    assert N % BLOCK_N == 0
+    assert K % BLOCK_K == 0
+
+    NUM_BLOCK_M = M // BLOCK_M
+    NUM_BLOCK_N = N // BLOCK_N
+    NUM_BLOCK_K = K // BLOCK_K
+
+    # Blocking N dimension (the RHS free dimension)
+    for n in nl.affine_range(NUM_BLOCK_N):
+        result_tiles = nl.zeros((NUM_BLOCK_M, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N,
+            nl.par_dim(TILE_M), TILE_N),
+            dtype=lhsT.dtype,
+            buffer=nl.sbuf)
+
+        # Blocking K dimension (the contraction dimension)
+        # Use `sequential_range` because we do not want the compiler to change this loop by, 
+        # for example, vectorizing it
+        for k in nl.sequential_range(NUM_BLOCK_K):
+            # Loading tiles from rhs
+            # setting the load tile to `TILE_K x BLOCK_SIZE_N` to optimize DMA performance
+            i_rhs = nl.mgrid[0:TILE_K, 0:BLOCK_N]
+            rhs_tiles = nl.ndarray((TILES_IN_BLOCK_K, nl.par_dim(TILE_K), BLOCK_N),
+                                    dtype=rhs.dtype,
+                                    buffer=nl.sbuf)
+
+            for bk_r in nl.affine_range(TILES_IN_BLOCK_K):
+                rhs_tiles[bk_r, i_rhs.p, i_rhs.x] = nl.load(
+                    rhs[(TILES_IN_BLOCK_K * k + bk_r) * TILE_K + i_rhs.p,
+                    BLOCK_N * n + i_rhs.x])
+
+            # Blocking M dimension (the LHS free dimension)
+            for m in nl.affine_range(NUM_BLOCK_M):
+            # Loading tiles from lhsT
+                i_lhsT = nl.mgrid[0:TILE_K, 0:BLOCK_M]
+                lhsT_tiles = nl.ndarray((TILES_IN_BLOCK_K, nl.par_dim(TILE_K), BLOCK_M),
+                                        dtype=lhsT.dtype,
+                                        buffer=nl.sbuf)
+                for bk_l in nl.affine_range(TILES_IN_BLOCK_K):
+                    lhsT_tiles[bk_l, i_lhsT.p, i_lhsT.x] = nl.load(
+                        lhsT[(TILES_IN_BLOCK_K * k + bk_l) * TILE_K + i_lhsT.p,
+                        BLOCK_M * m + i_lhsT.x])
+
+                # Do matmul with all tiles in the blocks
+                i_lhsT_mm = nl.mgrid[0:TILE_K, 0:TILE_M]
+                i_rhs_mm = nl.mgrid[0:TILE_K, 0:TILE_N]
+                i_res_mm = nl.mgrid[0:TILE_M, 0:TILE_N]
+                for bn in nl.affine_range(TILES_IN_BLOCK_N):
+                    for bm in nl.affine_range(TILES_IN_BLOCK_M):
+                        res_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+
+                        for bk in nl.affine_range(TILES_IN_BLOCK_K):
+                            res_tile[...] += nisa.nc_matmul(
+                                lhsT_tiles[bk, i_lhsT_mm.p, bm * TILE_M + i_lhsT_mm.x],
+                                rhs_tiles[bk, i_rhs_mm.p, bn * TILE_N + i_rhs_mm.x])
+
+                        # Accumulate on corresponding SBUF tile
+                        result_tiles[m, bm, bn, i_res_mm.p,
+                            i_res_mm.x] += res_tile[i_res_mm.p, i_res_mm.x]
+
+        # Copying the result from SBUF to HBM
+        for m in nl.affine_range(NUM_BLOCK_M):
+            for bm in nl.affine_range(TILES_IN_BLOCK_M):
+                i_res = nl.mgrid[0:TILE_K, 0:TILE_N]
+                i_res_packed = nl.mgrid[0:TILE_K, 0:BLOCK_N]
+                result_packed = nl.ndarray((TILE_K, BLOCK_N),
+                    dtype=result_tiles.dtype,
+                    buffer=nl.sbuf)
+
+                # coalesce result tiles for better DMA performance
+                for bn in nl.affine_range(TILES_IN_BLOCK_N):
+                    result_packed[i_res.p,
+                        bn * TILE_N + i_res.x] = nl.copy(result_tiles[m, bm, bn,
+                                                                    i_res.p,
+                                                                    i_res.x])
+                nl.store(result[(TILES_IN_BLOCK_M * m + bm) * TILE_K + i_res_packed.p,
+                                BLOCK_N * n + i_res_packed.x],
+                            value=result_packed[i_res_packed.p, i_res_packed.x])
+
+    return result
 
 
 @nki.jit
@@ -92,6 +199,10 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, eps):
     # Where RMS(a_tensor) = sqrt((1/N) * sum(a_tensor * a_tensor))
     # and N = a_tensor.shape[1]
     # Reduction (mean) is performed in the free (2nd) dimension
+
+    if __debug__ and SIMPLE_PROFILE:
+        rms_kernel_start = time.time()
+
     out_tensor = nl.ndarray(a_tensor.shape, dtype=a_tensor.dtype,
                           buffer=nl.shared_hbm)
 
@@ -143,6 +254,11 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, eps):
 
             # store the addition results back to external memory (out_tensor)
             nl.store(out_tensor[b, i * 128 + ix, iy], value=out_tile, mask=(i * 128 + ix < num_rows))
+
+    if __debug__ and SIMPLE_PROFILE:
+        rms_kernel_end = time.time()
+        print(f"RMSNorm Kernel time: {rms_kernel_end - rms_kernel_start:.6f} s")
+
 
     return out_tensor
 
@@ -272,6 +388,18 @@ class NeuronLlamaMLP(nn.Module):
 
     def __init__(self, config: InferenceConfig):
         super().__init__()
+
+        if __debug__ and SIMPLE_PROFILE:
+            self.total_dup_time = 0.0  
+            self.total_wgate_time = 0.0  
+            self.total_wup_time = 0.0  
+            self.total_act_time = 0.0  
+            self.total_mul_time = 0.0  
+            self.total_wdown_time = 0.0  
+            self.total_fused_mlp_time = 0.0  
+            self.call_count = 0  
+
+
         self.config = config
         self.neuron_config = config.neuron_config
         self.tp_degree = config.neuron_config.tp_degree
@@ -623,25 +751,66 @@ class NeuronLlamaMLP(nn.Module):
         logger.debug("MLP: native compiler")
         # all-gather is done here instead of CPL layers to
         # avoid 2 all-gathers from up and gate projections
+
+        if __debug__ and SIMPLE_PROFILE:
+            dup_start = time.time()
+
         if self.sequence_parallel_enabled:
             x = gather_from_sequence_parallel_region(
                 x, self.sequence_dimension, process_group=get_tp_group(self.config)
             )
+        if __debug__ and SIMPLE_PROFILE:
+            self.dup_time = time.time() - dup_start
 
+        if __debug__ and SIMPLE_PROFILE: wgate_start = time.time()
         gate_proj_output = (
             self.gate_proj(x)
             if not is_lora_module(self.gate_proj)
             else self.gate_proj(x, adapter_ids)
         )
+        if __debug__ and SIMPLE_PROFILE: self.wgate_time = time.time() - wgate_start
+
+        if __debug__ and SIMPLE_PROFILE: wup_start = time.time()
         up_proj_output = (
             self.up_proj(x) if not is_lora_module(self.up_proj) else self.up_proj(x, adapter_ids)
         )
-        down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
+        if __debug__ and SIMPLE_PROFILE: self.wup_time = time.time() - wup_start
+
+        #FY : modify the code a bit to extract the latency of act_fn
+        #down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
+
+        if __debug__ and SIMPLE_PROFILE: act_start = time.time()
+        act_output = self.act_fn(gate_proj_output)
+        if __debug__ and SIMPLE_PROFILE: self.act_time = time.time() - act_start
+
+        if __debug__ and SIMPLE_PROFILE: mul_start = time.time()
+        down_proj_input = act_output * up_proj_output
+        if __debug__ and SIMPLE_PROFILE: self.mul_time = time.time() - mul_start
+        
+        if __debug__ and SIMPLE_PROFILE: wdown_start = time.time()
         output = (
             self.down_proj(down_proj_input)
             if not is_lora_module(self.up_proj)
             else self.down_proj(down_proj_input, adapter_ids)
         )
+        if __debug__ and SIMPLE_PROFILE: self.wdown_time = time.time() - wdown_start
+
+        if __debug__ and SIMPLE_PROFILE:
+            self.call_count += 1  
+            self.total_dup_time += self.dup_time  
+            self.total_act_time += self.act_time
+            self.total_mul_time += self.mul_time
+            self.total_wgate_time += self.wgate_time
+            self.total_wdown_time += self.wdown_time
+            self.total_wup_time += self.wup_time
+            logger.info(f"MLP layer timings (token {self.call_count}): dup={self.dup_time:.6f}s, Wgate={self.wgate_time:.6f}s, Wup={self.wup_time:.6f}s, "  
+                f"activation={self.act_time:.6f}s, multiply={self.mul_time:.6f}s, Wdown={self.wdown_time:.6f}s")  
+            logger.info(f"MLP layer average over {self.call_count} tokens: dup={self.total_dup_time/self.call_count:.6f}s, "  
+                f"Wgate={self.total_wgate_time/self.call_count:.6f}s, Wup={self.total_wup_time/self.call_count:.6f}s, "  
+                f"activation={self.total_act_time/self.call_count:.6f}s, multiply={self.total_mul_time/self.call_count:.6f}s, "  
+                f"Wdown={self.total_wdown_time/self.call_count:.6f}s")  
+
+
         logger.debug(f"MLP output shape {output.shape}")
         return output
 
@@ -788,6 +957,11 @@ class Llama3RotaryEmbedding(nn.Module):
     @torch.no_grad()
     def forward(self, x, position_ids):
         # x: [bs, num_attention_heads, seq_len, head_size]
+
+        # FY: rotary embedding latency profiling
+        if __debug__ and SIMPLE_PROFILE:
+            rotary_embedding_start = time.time()
+
         if self.inv_freq is None:
             inv_freq = 1.0 / (
                 self.base
@@ -820,6 +994,11 @@ class Llama3RotaryEmbedding(nn.Module):
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos()
             sin = emb.sin()
+
+        if __debug__ and SIMPLE_PROFILE:
+            rotary_embedding_end = time.time()
+            print(f"Positional encoding(rotary embedding) time: {rotary_embedding_end - rotary_embedding_start:.6f} s")
+
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -871,11 +1050,23 @@ class NeuronLlamaDecoderLayer(nn.Module):
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
 
+        if __debug__ and SIMPLE_PROFILE:
+            total_start = time.time()
+
+        # if SIMPLE_PROFILE:
+        #     rmsnorm_self_attn_start = time.time()
+        
         # RMSNorm (fused with QKV kernel when SP is disabled)
         if (not self.qkv_kernel_enabled or self.sequence_parallel_enabled) and self.input_layernorm:
             hidden_states = self.input_layernorm(hidden_states)
 
+        # if SIMPLE_PROFILE:
+        #     rmsnorm_self_attn_end = time.time()
+        #     print(f"Layer {self.layer_index}: rms norm in Self-attention time = {rmsnorm_self_attn_end - rmsnorm_self_attn_start:.6f} s")
+
         # Self Attention
+        if __debug__ and SIMPLE_PROFILE:
+            self_attn_start = time.time()
         hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -885,33 +1076,60 @@ class NeuronLlamaDecoderLayer(nn.Module):
             rmsnorm=self.input_layernorm,
             **kwargs,
         )
+        if __debug__ and SIMPLE_PROFILE:
+            self_attn_end = time.time()
+            print(f"Layer {self.layer_index}: Self-attention time = {self_attn_end - self_attn_start:.6f} s")
+
 
         if self.mlp_kernel_enabled and self.mlp_kernel_fuse_residual_add:
             assert (
                 not self.sequence_parallel_enabled
             ), "mlp_kernel_fuse_residual_add should be off when sequence parallelism is enabled"
             # First residual add handled in the MLP kernel
+
+            if __debug__ and SIMPLE_PROFILE:
+                fused_ffn_start = time.time()
             hidden_states, residual = self.mlp(
                 hidden_states,
                 rmsnorm=self.post_attention_layernorm,
                 residual=residual,
                 adapter_ids=adapter_ids,
             )
+            if __debug__ and SIMPLE_PROFILE:
+                fused_ffn_end = time.time()
+                print(f"Layer {self.layer_index}: Fused FFN time = {fused_ffn_end - fused_ffn_start:.6f} s")
         else:
             hidden_states = residual + hidden_states
             residual = hidden_states
             # RMSNorm (fused with QKV kernel when SP is disabled)
             if not self.mlp_kernel_enabled or self.sequence_parallel_enabled:
                 hidden_states = self.post_attention_layernorm(hidden_states)
+            
+            if __debug__ and SIMPLE_PROFILE:
+                unfused_ffn_start = time.time()
             hidden_states, _ = self.mlp(
                 hidden_states,
                 rmsnorm=self.post_attention_layernorm,
                 adapter_ids=adapter_ids,
             )
+            if __debug__ and SIMPLE_PROFILE:
+                unfused_ffn_end = time.time()
+                print(f"Layer {self.layer_index}: FFN time = {unfused_ffn_end - unfused_ffn_start:.6f} s")
 
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states, present_key_value, cos_cache, sin_cache)
+
+        if __debug__ and SIMPLE_PROFILE:
+            total_end = time.time()
+
+            total_time = total_end - total_start
+            print(f"Total time for token: {total_time:.6f} s")
+        
+            # print(f"Embedding: {embed_time/total_time:.2%}, PosEnc: {pos_time/total_time:.2%}, "
+            #     f"Self-Attn: {attn_time/total_time:.2%}, FFN: {ffn_time/total_time:.2%}, "
+            #     f"Final linear: {lm_time/total_time:.2%}")
+
         return outputs
 
 
@@ -967,6 +1185,8 @@ class NeuronLlamaModel(NeuronBaseModel):
         self.vocab_size = config.vocab_size
 
         if parallel_state.model_parallel_is_initialized():
+            if __debug__ and SIMPLE_PROFILE:
+                embedding_start = time.time();
             self.embed_tokens = ParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -978,6 +1198,9 @@ class NeuronLlamaModel(NeuronBaseModel):
                 tensor_model_parallel_group=get_tp_group(config),
                 use_spmd_rank=config.neuron_config.vocab_parallel,
             )
+            if __debug__ and SIMPLE_PROFILE:
+                embedding_end = time.time();
+                print(f"Embedding layer time: {embedding_end - embedding_start:.6f} s")
 
             self.lm_head = ColumnParallelLinear(
                 config.hidden_size,
@@ -1011,6 +1234,11 @@ class NeuronLlamaModel(NeuronBaseModel):
             else:
                 updated_configs.append(config)
         self.layers = nn.ModuleList([NeuronLlamaDecoderLayer(conf) for conf in updated_configs])
+
+        # FY: mark each layer with numerical value
+        for i, layer in enumerate(self.layers):
+            layer.layer_index = i
+
         if not config.neuron_config.is_eagle_draft:
             self.norm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps, nki_enabled=config.neuron_config.nki_enabled)
 
