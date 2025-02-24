@@ -89,9 +89,135 @@ _LLAMA_MODULE_MAP = {}
 
 logger = logging.getLogger("Neuron")
 
-import neuronxcc.nki as nki
-import neuronxcc.nki.language as nl
+# @nki.jit
+# def nki_matmul_fully_optimized_(
+#     lhsT,
+#     rhs,
+#     TILES_IN_BLOCK_M=16,
+#     TILES_IN_BLOCK_N=2,
+#     TILES_IN_BLOCK_K=8,
+# ):
+#     return 0
 
+@nki.jit
+def nki_mat_mul_test(lhs, rhs):
+
+    M, K = lhs.shape         # [M, K]
+    K2, N = rhs.shape        # [K, N]
+    assert K == K2
+
+    TILE_M = 128
+    TILE_K = 128
+    TILE_N = 512
+    TILES_IN_BLOCK_M = 16
+    TILES_IN_BLOCK_N = 2
+    TILES_IN_BLOCK_K = 8
+
+    BLOCK_M = TILE_M * TILES_IN_BLOCK_M  # 128*16=2048
+    BLOCK_N = TILE_N * TILES_IN_BLOCK_N  # 512*2=1024
+    BLOCK_K = TILE_K * TILES_IN_BLOCK_K  # 128*8=1024
+
+    result = nl.zeros((M, N), dtype=lhs.dtype, buffer=nl.shared_hbm)
+
+    aligned = (M % BLOCK_M == 0) and (N % BLOCK_N == 0) and (K % BLOCK_K == 0)
+    if aligned:
+        temp_aligned = nki_matmul_fully_optimized_(lhs.T, rhs)
+
+        i_xy = nl.mgrid[0:M, 0:N]
+        nl.store(
+            result[i_xy.p, i_xy.x],
+            temp_aligned[i_xy.p, i_xy.x]
+        )
+        return result
+
+    M_main = (M // BLOCK_M) * BLOCK_M
+    N_main = (N // BLOCK_N) * BLOCK_N
+    K_main = (K // BLOCK_K) * BLOCK_K
+
+    if (M_main > 0) and (N_main > 0) and (K_main > 0):
+        lhs_mainT = nl.ndarray((K_main, M_main), dtype=lhs.dtype, buffer=nl.sbuf)
+        i_lhs = nl.mgrid[0:K_main, 0:M_main]
+        nl.load(
+            lhs[i_lhs.x, i_lhs.p], 
+            out=lhs_mainT[i_lhs.p, i_lhs.x]
+        )
+
+        rhs_main = nl.ndarray((K_main, N_main), dtype=rhs.dtype, buffer=nl.sbuf)
+        i_rhs = nl.mgrid[0:K_main, 0:N_main]
+        nl.load(
+            rhs[i_rhs.p, i_rhs.x],
+            out=rhs_main[i_rhs.p, i_rhs.x]
+        )
+
+        out_main = nki_matmul_fully_optimized_(lhs_mainT, rhs_main)
+
+        i_main = nl.mgrid[0:M_main, 0:N_main]
+        nl.store(
+            result[i_main.p, i_main.x],
+            out_main[i_main.p, i_main.x]
+        )
+
+    K_tail = K - K_main
+    if (M_main > 0) and (N_main > 0) and (K_tail > 0):
+        res_sub = nl.copy(
+            result[0:M_main, 0:N_main], 
+            dtype=nl.float32,           
+            buffer=nl.psum
+        )
+
+        i_sub = nl.mgrid[0:M_main, 0:N_main]
+        for kk in nl.sequential_range(K_tail):
+            lhs_col = nl.load(lhs[i_sub.p, K_main + kk])     
+            rhs_row = nl.load(rhs[K_main + kk, i_sub.x])        
+            res_sub[i_sub.p, i_sub.x] += lhs_col[i_sub.p] * rhs_row[i_sub.x]
+
+        nl.store(
+            result[i_sub.p, i_sub.x],
+            res_sub[i_sub.p, i_sub.x]
+        )
+
+    N_tail = N - N_main
+    if (M_main > 0) and (N_tail > 0):
+        i_tr = nl.mgrid[0:M_main, 0:N_tail] 
+        res_tr = nl.zeros((M_main, N_tail), dtype=nl.float32, buffer=nl.psum)
+        for kk in nl.sequential_range(K): 
+            lhs_col = nl.load(lhs[i_tr.p, kk])     
+            rhs_col = nl.load(rhs[kk, N_main + i_tr.x]) 
+            res_tr[i_tr.p, i_tr.x] += lhs_col[i_tr.p] * rhs_col[i_tr.x]
+
+        nl.store(
+            result[i_tr.p, N_main + i_tr.x],
+            res_tr[i_tr.p, i_tr.x]
+        )
+
+    M_tail = M - M_main
+    if (M_tail > 0) and (N_main > 0):
+        i_bl = nl.mgrid[0:M_tail, 0:N_main]
+        res_bl = nl.zeros((M_tail, N_main), dtype=nl.float32, buffer=nl.psum)
+        for kk in nl.sequential_range(K):
+            lhs_col = nl.load(lhs[M_main + i_bl.p, kk])    
+            rhs_col = nl.load(rhs[kk, i_bl.x])              
+            res_bl[i_bl.p, i_bl.x] += lhs_col[i_bl.p] * rhs_col[i_bl.x]
+
+        nl.store(
+            result[M_main + i_bl.p, i_bl.x],
+            res_bl[i_bl.p, i_bl.x]
+        )
+
+    if (M_tail > 0) and (N_tail > 0):
+        i_br = nl.mgrid[0:M_tail, 0:N_tail]
+        res_br = nl.zeros((M_tail, N_tail), dtype=nl.float32, buffer=nl.psum)
+        for kk in nl.sequential_range(K):
+            lhs_col = nl.load(lhs[M_main + i_br.p, kk])        # shape [M_tail]
+            rhs_col = nl.load(rhs[kk, N_main + i_br.x])        # shape [N_tail]
+            res_br[i_br.p, i_br.x] += lhs_col[i_br.p] * rhs_col[i_br.x]
+
+        nl.store(
+            result[M_main + i_br.p, N_main + i_br.x],
+            res_br[i_br.p, i_br.x]
+        )
+
+    return result
 
 @nki.jit
 def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=False,
@@ -270,6 +396,146 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
 
 
 @nki.jit
+def nki_matmul_quantized_fp8_rhs(
+    lhsT,
+    rhs_fp8,
+    # Meta-parameters
+    TILES_IN_BLOCK_M=16,
+    TILES_IN_BLOCK_N=2,
+    TILES_IN_BLOCK_K=8,
+):
+
+    # Dimensions
+    K, M = lhsT.shape        # lhsT is shape [K, M]
+    K_, N = rhs_fp8.shape    # rhs_fp8 is shape [K, N]
+    assert K == K_, "lhsT and rhs_fp8 must have the same K dimension"
+
+    # Prepare the result in BF16
+    result = nl.ndarray((M, N), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    # Tiling sizes derived from hardware constraints
+    TILE_M = nl.tile_size.gemm_stationary_fmax  # Typically 128
+    TILE_K = nl.tile_size.pmax                  # Typically 128
+    TILE_N = nl.tile_size.gemm_moving_fmax      # Typically 512
+
+    BLOCK_M = TILE_M * TILES_IN_BLOCK_M
+    BLOCK_N = TILE_N * TILES_IN_BLOCK_N
+    BLOCK_K = TILE_K * TILES_IN_BLOCK_K
+
+    # Validate that M, N, K are multiples of block sizes
+    assert M % BLOCK_M == 0, f"M={M} not multiple of BLOCK_M={BLOCK_M}"
+    assert N % BLOCK_N == 0, f"N={N} not multiple of BLOCK_N={BLOCK_N}"
+    assert K % BLOCK_K == 0, f"K={K} not multiple of BLOCK_K={BLOCK_K}"
+
+    NUM_BLOCK_M = M // BLOCK_M
+    NUM_BLOCK_N = N // BLOCK_N
+    NUM_BLOCK_K = K // BLOCK_K
+
+    # -------------------------------------------------------------------------
+    # 1) Load the entire FP8 rhs into on-chip memory (SBUF) just once
+    # -------------------------------------------------------------------------
+    # ***IMPORTANT***: This requires that K*N fits in on-chip memory, which
+    # may be very large. If rhs is too big, you need a more advanced tiling approach.
+    rhs_sbuf = nl.ndarray((K, N), dtype=nl.float8_e4m3, buffer=nl.sbuf)
+    rhs_sbuf[...] = nl.load(rhs_fp8)  # single load from HBM -> SBUF
+    # Now 'rhs_sbuf' holds the entire rhs in FP8 E4M3 format on-chip.
+
+    # -------------------------------------------------------------------------
+    # 2) Matrix Multiply: For each block of M, N, K
+    # -------------------------------------------------------------------------
+    for n in nl.affine_range(NUM_BLOCK_N):
+        # result_tiles shape => (NUM_BLOCK_M, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N)
+        # We'll accumulate partial results in BF16 (instead of float32).
+        result_tiles = nl.zeros((NUM_BLOCK_M, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N,
+                                 nl.par_dim(TILE_M), TILE_N),
+                                dtype=nl.bfloat16,  # partial sums in BF16
+                                buffer=nl.sbuf)
+
+        # ---------------------------------------------------------------------
+        # 2a) Block over K dimension
+        # ---------------------------------------------------------------------
+        for k_blk in nl.sequential_range(NUM_BLOCK_K):
+            # We'll load sub-tiles of 'lhsT' from HBM repeatedly.
+            # But for rhs, we have everything in rhs_sbuf. We just index from it.
+
+            # Prepare a SBUF buffer for sub-tiles of shape (TILES_IN_BLOCK_K, TILE_K, BLOCK_N).
+            i_rhs = nl.mgrid[0:TILE_K, 0:BLOCK_N]
+            rhs_tiles = nl.ndarray((TILES_IN_BLOCK_K, nl.par_dim(TILE_K), BLOCK_N),
+                                   dtype=nl.bfloat16,  # We'll cast FP8->BF16
+                                   buffer=nl.sbuf)
+
+            # Load sub-blocks of 'rhs_sbuf' from on-chip memory (FP8) and cast to BF16
+            for bk_r in nl.affine_range(TILES_IN_BLOCK_K):
+                # Indices for the K dimension
+                k_offset = (TILES_IN_BLOCK_K * k_blk + bk_r) * TILE_K
+                rhs_tiles[bk_r, i_rhs.p, i_rhs.x] = nl.cast(
+                    rhs_sbuf[k_offset + i_rhs.p, BLOCK_N * n + i_rhs.x],
+                    dtype=nl.bfloat16
+                )
+
+            # -----------------------------------------------------------------
+            # 2b) Block over M dimension
+            # -----------------------------------------------------------------
+            for m in nl.affine_range(NUM_BLOCK_M):
+                # Load sub-blocks of lhsT (still in BF16) from HBM
+                i_lhsT = nl.mgrid[0:TILE_K, 0:BLOCK_M]
+                lhsT_tiles = nl.ndarray((TILES_IN_BLOCK_K, nl.par_dim(TILE_K), BLOCK_M),
+                                        dtype=lhsT.dtype,  # BF16
+                                        buffer=nl.sbuf)
+                for bk_l in nl.affine_range(TILES_IN_BLOCK_K):
+                    lhsT_tiles[bk_l, i_lhsT.p, i_lhsT.x] = nl.load(
+                        lhsT[(TILES_IN_BLOCK_K * k_blk + bk_l) * TILE_K + i_lhsT.p,
+                             BLOCK_M * m + i_lhsT.x])
+
+                # -------------------------------------------------------------
+                # 2c) Perform the local matmul across sub-tiles
+                # -------------------------------------------------------------
+                i_lhsT_mm = nl.mgrid[0:TILE_K, 0:TILE_M]   # shape => [TILE_K, TILE_M]
+                i_rhs_mm = nl.mgrid[0:TILE_K, 0:TILE_N]    # shape => [TILE_K, TILE_N]
+                i_res_mm = nl.mgrid[0:TILE_M, 0:TILE_N]    # shape => [TILE_M, TILE_N]
+
+                for bn in nl.affine_range(TILES_IN_BLOCK_N):
+                    for bm in nl.affine_range(TILES_IN_BLOCK_M):
+                        # BF16 partial sum tile
+                        res_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.bfloat16, buffer=nl.psum)
+
+                        # Loop over TILES_IN_BLOCK_K to accumulate partial products
+                        for bk in nl.affine_range(TILES_IN_BLOCK_K):
+                            # Multiply LHS (BF16) with RHS (BF16).
+                            # nisa.nc_matmul automatically promotes to higher precision internally
+                            # then accumulates into BF16 partial sum.
+                            lhs_sub = lhsT_tiles[bk, i_lhsT_mm.p, bm * TILE_M + i_lhsT_mm.x]
+                            rhs_sub = rhs_tiles[bk, i_rhs_mm.p, bn * TILE_N + i_rhs_mm.x]
+                            res_tile[...] += nisa.nc_matmul(lhs_sub, rhs_sub)
+
+                        # Add partial sums to result_tiles in BF16
+                        result_tiles[m, bm, bn, i_res_mm.p, i_res_mm.x] += res_tile[
+                            i_res_mm.p, i_res_mm.x
+                        ]
+
+        # ---------------------------------------------------------------------
+        # 2d) Copy partial results from SBUF to final result in HBM
+        # ---------------------------------------------------------------------
+        for m in nl.affine_range(NUM_BLOCK_M):
+            for bm in nl.affine_range(TILES_IN_BLOCK_M):
+                i_res = nl.mgrid[0:TILE_K, 0:TILE_N]
+                i_res_packed = nl.mgrid[0:TILE_K, 0:BLOCK_N]
+                result_packed = nl.ndarray((TILE_K, BLOCK_N),
+                                           dtype=result_tiles.dtype,
+                                           buffer=nl.sbuf)
+                # Coalesce tiles for better DMA
+                for bn in nl.affine_range(TILES_IN_BLOCK_N):
+                    result_packed[i_res.p, bn * TILE_N + i_res.x] = nl.copy(
+                        result_tiles[m, bm, bn, i_res.p, i_res.x]
+                    )
+                # Finally store to 'result' in BF16
+                nl.store(result[(TILES_IN_BLOCK_M * m + bm) * TILE_K + i_res_packed.p,
+                                BLOCK_N * n + i_res_packed.x],
+                         value=result_packed[i_res_packed.p, i_res_packed.x])
+
+    return result
+
+@nki.jit
 def tensor_transpose2D_kernel_(in_tensor, shape2D):
     out_tensor = nl.ndarray(in_tensor.shape, dtype=in_tensor.dtype,
                             buffer=nl.shared_hbm)
@@ -415,6 +681,9 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, eps):
     # and N = a_tensor.shape[1]
     # Reduction (mean) is performed in the free (2nd) dimension
 
+
+
+
     if __debug__ and SIMPLE_PROFILE:
         rms_kernel_start = time.time()
 
@@ -442,6 +711,7 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, eps):
         for i in range(math.ceil(a_tensor.shape[1]/128)):
             # Load input data from external memory to on-chip memory
             a_tile = nl.zeros([128, a_tensor.shape[2]], a_tensor.dtype)
+            print("a tensor shape2", a_tensor.shape[2])
             a_tile[...] = nl.load(a_tensor[b, i * 128 + ix, iy], mask=(i * 128 + ix < num_rows))
 
             # Compute element-wise square of a_tensor
