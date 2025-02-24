@@ -156,7 +156,7 @@ Make your submission here: https://forms.gle/zZKKS6RzKcerf4vH8
 
 ## Benchmarks
 
-Submissions will be tested using 25 benchmarks (prompts) with varying context lengths (TBD, but likely 1K \-\> 128K) and batch sizes (TBD, but likely 1-\>4). We have provided 5 prompts in `prompts.txt`. The remaining 20 will be withheld for evaluation.
+Submissions will be tested using 25 benchmarks (prompts) with varying context lengths (TBD, but likely 1K \-\> 128K) and batch sizes (TBD, but likely 1-\>4). We have provided 5 prompts in `prompts.txt` with their corresponding metadata (prompt ID, prompt length, recommended sequence length, and baseline latency/throughput) in `prompt_data.txt`. You can run `python test.py` to evaluate these prompts. The remaining 20 prompts will be withheld for evaluation.
 
 All benchmarks will become publicly available after the contest is complete.
 
