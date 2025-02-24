@@ -13,6 +13,8 @@ def parse_prompt_data(filepath):
         content = file.read()
 
     blocks = content.split('\n')
+    if blocks[-1] == '':
+        blocks = blocks[0:-1]
     return [block.split(',') for block in blocks]
 
 
@@ -21,7 +23,7 @@ def main():
     prompt_data = parse_prompt_data("prompt_data.txt")
     assert len(prompts) == len(prompt_data)
 
-    mode = "generate"
+    mode = "evaluate"
 
     # Iterate through the prompts
     for i, prompt in enumerate(prompts):
