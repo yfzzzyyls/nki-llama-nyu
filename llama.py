@@ -570,20 +570,127 @@ def tensor_transpose2D_kernel_(in_tensor, shape2D):
     return out_tensor
 
 
+
+@nki.jit
+def nki_matmul_basic_(lhsT, rhs):
+    """NKI kernel to compute a 64x128x512 matrix multiplication operation
+
+    Args:
+        lhsT: an input tensor of shape [128,64], a left hand side argument of the
+        matrix multiplication, delivered transposed for optimal performance
+        rhs: an input tensor of shape [128,512], a right hand side argument of the
+        matrix multiplication
+    Returns:
+        result: the resulting output tensor of shape [64,512]
+    """
+    # result = nl.ndarray((64, 512), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+    result = nl.ndarray((32, 8192), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+
+
+    # Defining indexes for input LHS.T
+    # - Note: here we take LayoutConstraint #1 into account:
+    # "For MatMult, contraction axis must be mapped to P-dim"
+    i_lhsT_p, i_lhsT_f = nl.mgrid[0:2048, 0:32]
+
+    # Defining indexes for input RHS
+    # - Note: here we take LayoutConstraint #1 into account:
+    # "For MatMult, contraction axis must be mapped to P-dim"
+    i_rhs_p, i_rhs_f = nl.mgrid[0:2048, 0:8192]
+
+    # Defining indexes for the output ([64,128]@[128,512] -> [64,512])
+    i_out_p, i_out_f = nl.mgrid[0:32, 0:8192]
+
+    # Loading the inputs (HBM->SBUF)
+    # Note: here we take Tile dtype definition into account,
+    # which forces P-dim as the left most index
+    lhs_tile = nl.load(lhsT[i_lhsT_p, i_lhsT_f])
+    rhs_tile = nl.load(rhs[i_rhs_p, i_rhs_f])
+
+    # Perform the matrix-multiplication
+    # Note1: We set transpose_x to True, to indicate that the LHS input is transposed
+    # Note2: A NKI matmul instruction always writes to PSUM in float32 data-type
+    result_psum = nl.matmul(lhs_tile, rhs_tile, transpose_x=True)
+
+    # Copy the result from PSUM back to SBUF, and cast to expected output data-type
+    result_sbuf = nl.copy(result_psum, dtype=result.dtype)
+
+    # The result of a [64,128] x [128,512] matrix multiplication has a shape of [64, 512].
+    # This dictates which indices to use to address the result tile.
+    nl.store(result[i_out_p, i_out_f], value=result_sbuf)
+
+    return result
+
+@nki.jit
+def nki_matmul_tiled_(lhsT, rhs):
+    """NKI kernel to compute a matrix multiplication operation in a tiled manner
+
+    Args:
+        lhsT: an input tensor of shape [K,M], where both K and M are multiples for
+            128.  It is the left-hand-side argument of the matrix multiplication,
+            delivered transposed for optimal performance.
+        rhs: an input tensor of shape [K,N], where K is a multiple of 128, and N
+            is a multiple of 512.  It is the right-hand-side argument of the matrix
+            multiplication.
+    Returns:
+        result: the resulting output tensor of shape [M,N]
+    """
+
+    K, M = lhsT.shape
+    K_, N = rhs.shape
+    assert K == K_, "lhsT and rhs must have the same contraction dimension"
+    result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+
+    # TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
+    TILE_M = 1
+    TILE_K = nl.tile_size.pmax  # 128
+    TILE_N = nl.tile_size.gemm_moving_fmax  # 512
+
+    # Use affine_range to loop over tiles
+    for m in nl.affine_range(M // TILE_M):
+        for n in nl.affine_range(N // TILE_N):
+            # Allocate a tensor in PSUM
+            res_psum = nl.zeros((TILE_M, TILE_N), nl.float32, buffer=nl.psum)
+
+            for k in nl.affine_range(K // TILE_K):
+                # Declare the tiles on SBUF
+                lhsT_tile = nl.ndarray((TILE_K, TILE_M), dtype=lhsT.dtype, buffer=nl.sbuf)
+                rhs_tile = nl.ndarray((TILE_K, TILE_N), dtype=rhs.dtype, buffer=nl.sbuf)
+
+                # Load tiles from lhsT and rhs
+                lhsT_tile[...] = nl.load(lhsT[k * TILE_K:(k + 1) * TILE_K,
+                                            m * TILE_M:(m + 1) * TILE_M])
+                rhs_tile[...] = nl.load(rhs[k * TILE_K:(k + 1) * TILE_K,
+                                            n * TILE_N:(n + 1) * TILE_N])
+
+                # Accumulate partial-sums into PSUM
+                res_psum += nl.matmul(lhsT_tile[...], rhs_tile[...], transpose_x=True)
+
+            # Copy the result from PSUM back to SBUF, and cast to expected output data-type
+            res_sb = nl.copy(res_psum, dtype=result.dtype)
+            nl.store(result[m * TILE_M:(m + 1) * TILE_M, n * TILE_N:(n + 1) * TILE_N],
+                value=res_sb)
+
+    return result
+
+
+
 @nki.jit
 def nki_matmul_fully_optimized_(
     lhsT,
     rhs,
-    TILES_IN_BLOCK_M=16,
-    TILES_IN_BLOCK_N=2,
-    TILES_IN_BLOCK_K=8,
+    TILES_IN_BLOCK_M=1,
+    TILES_IN_BLOCK_N=16,
+    TILES_IN_BLOCK_K=16,
 ):
     K, M = lhsT.shape
     K_, N = rhs.shape
     assert K == K_, "lhsT and rhs must have the same contraction dimension"
     result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
-    TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
+    #TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
+    
+    # FY:
+    TILE_M = min(nl.tile_size.gemm_stationary_fmax, M)
     TILE_K = nl.tile_size.pmax  # 128
     TILE_N = nl.tile_size.gemm_moving_fmax  # 512
 
@@ -903,6 +1010,17 @@ class NeuronLlamaMLP(nn.Module):
         self.quantized_kernel_lower_bound = self.neuron_config.quantized_kernel_lower_bound
         self.logical_neuron_cores = self.neuron_config.logical_neuron_cores
         mlp_bias = getattr(config, "mlp_bias", False)
+        self.mlp_bias = mlp_bias
+
+
+        # Print all the parameters:
+        print("hidden_size:", self.hidden_size)
+        print("intermediate_size:", self.intermediate_size)
+        print("bias:", mlp_bias)
+        print("dtype:", config.neuron_config.torch_dtype)
+        print("tensor_model_parallel_group:", get_tp_group(config))
+
+
         if parallel_state.model_parallel_is_initialized():
             if self.quantized_mlp_kernel_enabled:
                 # Quantized MLP kernels expect intermediate size to be multiple of 128, so we need to pad
@@ -950,6 +1068,7 @@ class NeuronLlamaMLP(nn.Module):
                 )
 
             else:
+                print("initialize columnxxx")
                 self.gate_proj = ColumnParallelLinear(
                     self.hidden_size,
                     self.intermediate_size,
@@ -984,6 +1103,9 @@ class NeuronLlamaMLP(nn.Module):
                     tensor_model_parallel_group=get_tp_group(config),
                     reduce_dtype=config.neuron_config.rpl_reduce_dtype,
                 )
+                # self.gate_proj.weight.data = transpose_parallel_linear_layer(self.gate_proj.weight.data)
+                # self.up_proj.weight.data   = transpose_parallel_linear_layer(self.up_proj.weight.data)
+                # self.down_proj.weight.data = transpose_parallel_linear_layer(self.down_proj.weight.data)
 
             if self.mlp_kernel_enabled:
                 if self.quantized_mlp_kernel_enabled:
@@ -1237,6 +1359,11 @@ class NeuronLlamaMLP(nn.Module):
         # all-gather is done here instead of CPL layers to
         # avoid 2 all-gathers from up and gate projections
 
+        # print("use native MLP")
+        # print("use FFN NKI kernel implementation")
+
+        # print("Input dimensions:", x.shape)
+
         if __debug__ and SIMPLE_PROFILE:
             dup_start = time.time()
 
@@ -1248,11 +1375,46 @@ class NeuronLlamaMLP(nn.Module):
             self.dup_time = time.time() - dup_start
 
         if __debug__ and SIMPLE_PROFILE: wgate_start = time.time()
+
+
+
+    # FFN Kernel gate project replacement starts here ################################################
+
+    # default size in evaluation mode
+        # input 1 x 32 x 2048 or 1 x 1 x 2048
+        # hidden : 2048
+        # intermediate: 8192
+
+    # extract weight Wgate
+        # Wgate = self.gate_proj.weight.detach().clone()
+    # information printout
+        # print("gate weight data", Wgate)
+        # print("input shape", x.shape[1], x.shape[2])
+        # print("batch 0 input data", x[0])
+    # transpose input x, x is dimenson 1 x 32 x 2048: use the bottom python transpose function
+        # tensor_transpose2D_kernel_(x[0], (x.shape[1], x.shape[2]))
+        # x_transposed = x.transpose(1, 2)
+    # do nki matmul: use the tiled version
+        # gate_proj_output = nki_matmul_tiled_(x_transposed[0], Wgate)
+        # gate_proj_output = nki_matmul_fully_optimized_(x_transposed[0], Wgate, 1, 16, 16)
+        # gate_proj_output = nki_matmul_basic_(x_transposed[0], Wgate)
+        
+        # gate_proj_kernel_output = nki_matmul_tiled_(x_transposed[0], Wgate)
+        # # gate_proj_output = (gate_proj_kernel_output, None)
+
+        # print("Kernel Result: ", gate_proj_kernel_output)
+
+        # gate_proj_output = self.gate_proj(x)
+        # print("Gold Result: ", gate_proj_output)
+
+    # below is the original implementation
         gate_proj_output = (
             self.gate_proj(x)
             if not is_lora_module(self.gate_proj)
             else self.gate_proj(x, adapter_ids)
         )
+    # FFN Kernel gate project replacement ends here    ################################################
+
         if __debug__ and SIMPLE_PROFILE: self.wgate_time = time.time() - wgate_start
 
         if __debug__ and SIMPLE_PROFILE: wup_start = time.time()
@@ -1261,23 +1423,31 @@ class NeuronLlamaMLP(nn.Module):
         )
         if __debug__ and SIMPLE_PROFILE: self.wup_time = time.time() - wup_start
 
-        #FY : modify the code a bit to extract the latency of act_fn
-        #down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
-
-        if __debug__ and SIMPLE_PROFILE: act_start = time.time()
-        act_output = self.act_fn(gate_proj_output)
-        if __debug__ and SIMPLE_PROFILE: self.act_time = time.time() - act_start
-
-        if __debug__ and SIMPLE_PROFILE: mul_start = time.time()
-        down_proj_input = act_output * up_proj_output
-        if __debug__ and SIMPLE_PROFILE: self.mul_time = time.time() - mul_start
+        down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
         
         if __debug__ and SIMPLE_PROFILE: wdown_start = time.time()
+
+################################################
+        # Wdown = self.down_proj.weight.detach().clone()
+        # print("gate weight data", Wgate)
+        # print("input shape", x.shape[1], x.shape[2])
+        # print("batch 0 input data", x[0])
+        # tensor_transpose2D_kernel_(x[0], (x.shape[1], x.shape[2]))
+        # gate_proj_output_transposed = gate_proj_output.transpose(1, 2)
+        
+        # gate_proj_kernel_output = nki_matmul_tiled_(x_transposed[0], Wgate)
+        # output = nki_matmul_tiled_(gate_proj_output_transposed[0], Wdown)
+        # print("Kernel Result: ", gate_proj_kernel_output)
+
+        # output = self.down_proj(down_proj_input)
+############################################################
+
         output = (
             self.down_proj(down_proj_input)
             if not is_lora_module(self.up_proj)
             else self.down_proj(down_proj_input, adapter_ids)
         )
+
         if __debug__ and SIMPLE_PROFILE: self.wdown_time = time.time() - wdown_start
 
         if __debug__ and SIMPLE_PROFILE:
@@ -1318,6 +1488,8 @@ class NeuronLlamaMLP(nn.Module):
             )
         else:
             # No kernel
+
+            # FY: returns a tupel(3-dim tensor, "None")
             return (self._native_mlp(x, rmsnorm, adapter_ids=adapter_ids), None)
 
 
