@@ -8,23 +8,13 @@ Input: \"A man, a plan, a canal: Panama\" Output: \"a man, a plan, a canal: pana
 Your function should be case-insensitive and ignore non-alphanumeric characters when determining palindromes. The function should be efficient and able to handle strings of up to 1000 characters in length.
 Provide your solution along with an explanation of your approach and its time complexity. Write a version that has lower time complexity than O(n^2).
 
-You are a detective investigating a series of art thefts at the city's most prestigious museums. Over the past month, four paintings have been stolen from three different museums. Here are the facts you've gathered so far:
-The thefts occurred on consecutive Fridays.
-Each theft took place between 2:00 PM and 4:00 PM.
-The security cameras were disabled during each theft.
-No signs of forced entry were found at any of the crime scenes.
-The stolen paintings are: a) \"Sunset over the Lake\" from the Metropolitan Museum b) \"The Weeping Willow\" from the National Gallery c) \"Dancers in the Rain\" from the Modern Art Museum d) \"Moonlit Sonata\" also from the Modern Art Museum
-Each painting was protected by a different security system: a) Laser grid b) Pressure-sensitive floor c) Infrared sensors d) Motion detectors
-The museums employ different security companies:
-Metropolitan Museum: SecureGuard
-National Gallery: SafeKeep
-Modern Art Museum: VigilantEye
-All four paintings were insured by the same company: ArtSure Insurance.
-Each museum reported that a staff member called in sick on the day of the theft.
-The sick staff members were: a) A tour guide at the Metropolitan Museum b) A custodian at the National Gallery c) A security guard at the Modern Art Museum (for both thefts)
-Trace evidence found at each scene included: a) Metropolitan Museum: A single black hair b) National Gallery: Traces of chalk dust c) Modern Art Museum (both thefts): Fibers from a blue uniform
-Based on this information, you suspect that these thefts are connected and possibly an inside job. Your task is to analyze the evidence and identify potential suspects or patterns that could lead to solving the case.
-Question: What logical conclusions can you draw from the given information, and what additional information would be most crucial to furthering the investigation?
+Five friends sit in a row facing north:
+Alex sits next to Beth.
+Beth sits next to Chen.
+Diana is not at any end.
+Elena sits between two people.
+Chen is not next to Diana.
+Determine the seating order and explain your logic.
 
 Explain the quote \"I do desire we may be better strangers\"
 
