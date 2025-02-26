@@ -124,11 +124,13 @@ def prepare_inference(model_cls, args):
 
     model_cls = NeuronLlamaForCausalLM
     neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
-
+    print("neuron_config")
+    print(neuron_config)
     config = model_cls.get_config_cls()(
         neuron_config, load_config=load_pretrained_config(args.model_path)
     )
-
+    print("Check Config")
+    print(config)
     model = model_cls(args.model_path, config)
 
     # Compile and save model.

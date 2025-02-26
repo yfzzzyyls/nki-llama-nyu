@@ -83,11 +83,18 @@ import neuronxcc.nki.language as nl
 
 import time
 
-SIMPLE_PROFILE = True
+SIMPLE_PROFILE = False
 
 _LLAMA_MODULE_MAP = {}
 
 logger = logging.getLogger("Neuron")
+logger.setLevel(level=logging.DEBUG)
+handler = logging.FileHandler("./app.log", encoding='UTF-8')
+handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
 
 # @nki.jit
 # def nki_matmul_fully_optimized_(
@@ -636,12 +643,14 @@ def nki_matmul_tiled_(lhsT, rhs):
     """
 
     K, M = lhsT.shape
+    print(K, M)
     K_, N = rhs.shape
+    print(K_, N)
     assert K == K_, "lhsT and rhs must have the same contraction dimension"
     result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
     # TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-    TILE_M = 1
+    TILE_M = M
     TILE_K = nl.tile_size.pmax  # 128
     TILE_N = nl.tile_size.gemm_moving_fmax  # 512
 
@@ -669,7 +678,7 @@ def nki_matmul_tiled_(lhsT, rhs):
             res_sb = nl.copy(res_psum, dtype=result.dtype)
             nl.store(result[m * TILE_M:(m + 1) * TILE_M, n * TILE_N:(n + 1) * TILE_N],
                 value=res_sb)
-
+    logger.debug("nki函数被调用")
     return result
 
 
@@ -1019,7 +1028,10 @@ class NeuronLlamaMLP(nn.Module):
         print("bias:", mlp_bias)
         print("dtype:", config.neuron_config.torch_dtype)
         print("tensor_model_parallel_group:", get_tp_group(config))
-
+        print("多层感知机内核使能状态:", self.mlp_kernel_enabled)
+        print("多层感知机NKI使能状态", self.neuron_config.nki_enabled)
+        print("量化多层感知机内核使能状态", self.quantized_mlp_kernel_enabled)
+        print("硬件并行状态", parallel_state.model_parallel_is_initialized())
 
         if parallel_state.model_parallel_is_initialized():
             if self.quantized_mlp_kernel_enabled:
@@ -1115,11 +1127,13 @@ class NeuronLlamaMLP(nn.Module):
 
                 else:
                     # Transpose the weights to the layout expected by kernels
-                    self.gate_proj.weight = transpose_parallel_linear_layer(self.gate_proj.weight)
-                    self.up_proj.weight = transpose_parallel_linear_layer(self.up_proj.weight)
-                    self.down_proj.weight = transpose_parallel_linear_layer(self.down_proj.weight)
+                    # self.gate_proj.weight = transpose_parallel_linear_layer(self.gate_proj.weight)
+                    # self.up_proj.weight = transpose_parallel_linear_layer(self.up_proj.weight)
+                    # self.down_proj.weight = transpose_parallel_linear_layer(self.down_proj.weight)
+                    pass
 
         else:
+            # 如果没法并行就直接用pytorch提供的线性层
             self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=mlp_bias)
             self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=mlp_bias)
             self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=mlp_bias)
@@ -1378,24 +1392,41 @@ class NeuronLlamaMLP(nn.Module):
 
 
 
-    # FFN Kernel gate project replacement starts here ################################################
+        # FFN Kernel gate project replacement starts here ################################################
 
-    # default size in evaluation mode
+        # default size in evaluation mode
         # input 1 x 32 x 2048 or 1 x 1 x 2048
         # hidden : 2048
         # intermediate: 8192
 
-    # extract weight Wgate
+        # extract weight Wgate
         # Wgate = self.gate_proj.weight.detach().clone()
-    # information printout
+        Wgate = self.gate_proj.weight.data
+        Wup = self.gate_proj.weight.data
+        Wdown = self.down_proj.weight.data
+
+        # information printout
+        logger.debug(f"门网络权重形状：{Wgate.shape}; 类型：{type(Wgate)}")
+        logger.debug(f"上网络权重形状：{Wup.shape}")
+        logger.debug(f"下网络权重形状：{Wdown.shape}")
         # print("gate weight data", Wgate)
         # print("input shape", x.shape[1], x.shape[2])
+        logger.debug(f"输入数据形状：{x.shape}")
         # print("batch 0 input data", x[0])
-    # transpose input x, x is dimenson 1 x 32 x 2048: use the bottom python transpose function
+
+        # transpose input x, x is dimenson 1 x 32 x 2048: use the bottom python transpose function
         # tensor_transpose2D_kernel_(x[0], (x.shape[1], x.shape[2]))
-        # x_transposed = x.transpose(1, 2)
-    # do nki matmul: use the tiled version
-        # gate_proj_output = nki_matmul_tiled_(x_transposed[0], Wgate)
+        x_transposed = x.transpose(1, 2)
+
+        # do nki matmul: use the tiled version
+        batch_size, sequence_length, dimension = x.shape
+        output_dimension = max(Wgate.shape)
+        nki_gate_proj_output = torch.zeros((batch_size, sequence_length, output_dimension), dtype=x.dtype, device=x.device)
+        for i in range(batch_size):
+            mul_result = nki_matmul_tiled_(x_transposed[i], Wgate.T)
+            print(f"Multiplication Result shape: {mul_result.shape}")
+            nki_gate_proj_output[i] = mul_result
+        logger.debug(f"门网络输出形状：{nki_gate_proj_output.shape}")
         # gate_proj_output = nki_matmul_fully_optimized_(x_transposed[0], Wgate, 1, 16, 16)
         # gate_proj_output = nki_matmul_basic_(x_transposed[0], Wgate)
         
@@ -1407,13 +1438,18 @@ class NeuronLlamaMLP(nn.Module):
         # gate_proj_output = self.gate_proj(x)
         # print("Gold Result: ", gate_proj_output)
 
-    # below is the original implementation
         gate_proj_output = (
-            self.gate_proj(x)
+            nki_gate_proj_output
             if not is_lora_module(self.gate_proj)
             else self.gate_proj(x, adapter_ids)
         )
-    # FFN Kernel gate project replacement ends here    ################################################
+        # below is the original implementation
+        # gate_proj_output = (
+        #     self.gate_proj(x)
+        #     if not is_lora_module(self.gate_proj)
+        #     else self.gate_proj(x, adapter_ids)
+        # )
+        # FFN Kernel gate project replacement ends here    ################################################
 
         if __debug__ and SIMPLE_PROFILE: self.wgate_time = time.time() - wgate_start
 
@@ -1423,6 +1459,10 @@ class NeuronLlamaMLP(nn.Module):
         )
         if __debug__ and SIMPLE_PROFILE: self.wup_time = time.time() - wup_start
 
+        print("Check")
+        print(f"Gate Shape:{gate_proj_output.shape}")
+        print(f"Up Shape:{up_proj_output.shape}")
+        print(f"Intermediate Size: {self.intermediate_size}")
         down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
         
         if __debug__ and SIMPLE_PROFILE: wdown_start = time.time()
@@ -1482,10 +1522,13 @@ class NeuronLlamaMLP(nn.Module):
                 return self._kernel_enabled_quantized_mlp(
                     x, fused_rmsnorm, rmsnorm, residual, adapter_ids=adapter_ids
                 )
+
+            # TODO: Entrance to Optimization
             # MLP kernel
-            return self._kernel_enabled_mlp(
-                x, fused_rmsnorm, rmsnorm, residual, adapter_ids=adapter_ids
-            )
+            # return self._kernel_enabled_mlp(
+            #     x, fused_rmsnorm, rmsnorm, residual, adapter_ids=adapter_ids
+            # )
+            return (self._native_mlp(x, rmsnorm, adapter_ids=adapter_ids), None)
         else:
             # No kernel
 
