@@ -1402,7 +1402,7 @@ class NeuronLlamaMLP(nn.Module):
         # extract weight Wgate
         # Wgate = self.gate_proj.weight.detach().clone()
         Wgate = self.gate_proj.weight.data
-        Wup = self.gate_proj.weight.data
+        Wup = self.up_proj.weight.data
         Wdown = self.down_proj.weight.data
 
         # information printout
@@ -1426,6 +1426,7 @@ class NeuronLlamaMLP(nn.Module):
             mul_result = nki_matmul_tiled_(x_transposed[i], Wgate.T)
             # print(f"Multiplication Result shape: {mul_result.shape}")
             nki_gate_proj_output[i] = mul_result
+        gate_proj_output = nki_gate_proj_output;
         # logger.debug(f"门网络输出形状：{nki_gate_proj_output.shape}")
         # gate_proj_output = nki_matmul_fully_optimized_(x_transposed[0], Wgate, 1, 16, 16)
         # gate_proj_output = nki_matmul_basic_(x_transposed[0], Wgate)
@@ -1438,8 +1439,6 @@ class NeuronLlamaMLP(nn.Module):
         # gate_proj_output = self.gate_proj(x)
         # print("Gold Result: ", gate_proj_output)
 
-        gate_proj_output = nki_gate_proj_output;
-
         # below is the original implementation
         # gate_proj_output = (
         #     self.gate_proj(x)
@@ -1451,9 +1450,18 @@ class NeuronLlamaMLP(nn.Module):
         if __debug__ and SIMPLE_PROFILE: self.wgate_time = time.time() - wgate_start
 
         if __debug__ and SIMPLE_PROFILE: wup_start = time.time()
-        up_proj_output = (
-            self.up_proj(x) if not is_lora_module(self.up_proj) else self.up_proj(x, adapter_ids)
-        )
+
+        # # FY: up_project nki matmul use the tiled version
+        up_proj_output = torch.zeros(batch_size, sequence_length, max(Wup.shape), dtype=x.dtype, device=x.device)
+        for i in range(batch_size):
+            up_proj_output[i] = nki_matmul_tiled_(x_transposed[i], Wup.T)
+
+        # print(f"Multiplication Result shape: {mul_result.shape}")
+
+        # up_proj_output = (
+        #     self.up_proj(x) if not is_lora_module(self.up_proj) else self.up_proj(x, adapter_ids)
+        # )
+
         if __debug__ and SIMPLE_PROFILE: self.wup_time = time.time() - wup_start
 
         # print("Check")
