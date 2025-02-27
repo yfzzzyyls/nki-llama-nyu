@@ -643,14 +643,14 @@ def nki_matmul_tiled_(lhsT, rhs):
     """
 
     K, M = lhsT.shape
-    print(K, M)
+    # print(K, M)
     K_, N = rhs.shape
-    print(K_, N)
+    # print(K_, N)
     assert K == K_, "lhsT and rhs must have the same contraction dimension"
     result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
     # TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-    TILE_M = M
+    TILE_M = 1
     TILE_K = nl.tile_size.pmax  # 128
     TILE_N = nl.tile_size.gemm_moving_fmax  # 512
 
@@ -678,7 +678,7 @@ def nki_matmul_tiled_(lhsT, rhs):
             res_sb = nl.copy(res_psum, dtype=result.dtype)
             nl.store(result[m * TILE_M:(m + 1) * TILE_M, n * TILE_N:(n + 1) * TILE_N],
                 value=res_sb)
-    logger.debug("nki函数被调用")
+    # logger.debug("nki函数被调用")
     return result
 
 
@@ -827,7 +827,7 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, eps):
         for i in range(math.ceil(a_tensor.shape[1]/128)):
             # Load input data from external memory to on-chip memory
             a_tile = nl.zeros([128, a_tensor.shape[2]], a_tensor.dtype)
-            print("a tensor shape2", a_tensor.shape[2])
+            # print("a tensor shape2", a_tensor.shape[2])
             a_tile[...] = nl.load(a_tensor[b, i * 128 + ix, iy], mask=(i * 128 + ix < num_rows))
 
             # Compute element-wise square of a_tensor
@@ -1023,15 +1023,15 @@ class NeuronLlamaMLP(nn.Module):
 
 
         # Print all the parameters:
-        print("hidden_size:", self.hidden_size)
-        print("intermediate_size:", self.intermediate_size)
-        print("bias:", mlp_bias)
-        print("dtype:", config.neuron_config.torch_dtype)
-        print("tensor_model_parallel_group:", get_tp_group(config))
-        print("多层感知机内核使能状态:", self.mlp_kernel_enabled)
-        print("多层感知机NKI使能状态", self.neuron_config.nki_enabled)
-        print("量化多层感知机内核使能状态", self.quantized_mlp_kernel_enabled)
-        print("硬件并行状态", parallel_state.model_parallel_is_initialized())
+        # print("hidden_size:", self.hidden_size)
+        # print("intermediate_size:", self.intermediate_size)
+        # print("bias:", mlp_bias)
+        # print("dtype:", config.neuron_config.torch_dtype)
+        # print("tensor_model_parallel_group:", get_tp_group(config))
+        # print("多层感知机内核使能状态:", self.mlp_kernel_enabled)
+        # print("多层感知机NKI使能状态", self.neuron_config.nki_enabled)
+        # print("量化多层感知机内核使能状态", self.quantized_mlp_kernel_enabled)
+        # print("硬件并行状态", parallel_state.model_parallel_is_initialized())
 
         if parallel_state.model_parallel_is_initialized():
             if self.quantized_mlp_kernel_enabled:
@@ -1040,7 +1040,7 @@ class NeuronLlamaMLP(nn.Module):
                 self.intermediate_size += (
                     get_padding_length(self.intermediate_size // tp_degree, 128) * tp_degree
                 )
-                logger.debug(f"Quantized intermediate_size: {self.intermediate_size}")
+                # logger.debug(f"Quantized intermediate_size: {self.intermediate_size}")
 
                 quantization_type = QuantizationType(self.neuron_config.quantization_type)
                 quantized_dtype = QuantizedDtype.F8E4M3
@@ -1080,7 +1080,7 @@ class NeuronLlamaMLP(nn.Module):
                 )
 
             else:
-                print("initialize columnxxx")
+                # print("initialize columnxxx")
                 self.gate_proj = ColumnParallelLinear(
                     self.hidden_size,
                     self.intermediate_size,
@@ -1141,9 +1141,9 @@ class NeuronLlamaMLP(nn.Module):
     def _kernel_enabled_quantized_mlp(self, x, fused_rmsnorm, rmsnorm, residual, adapter_ids):
         grid = (vnc(self.logical_neuron_cores),)
         fused_residual = residual is not None
-        logger.debug(
-            f"MLP: quantized kernel, fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, logical_neuron_cores={self.logical_neuron_cores}"
-        )
+        # logger.debug(
+        #     f"MLP: quantized kernel, fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, logical_neuron_cores={self.logical_neuron_cores}"
+        # )
 
         # Can't do residual add in the kernel if SP is enabled
         if fused_residual:
@@ -1163,9 +1163,9 @@ class NeuronLlamaMLP(nn.Module):
             # If we don't use this kernel, the MLP kernel below will do the
             # quantization, so we also pass lower_bound to that kernel.
             if self.rmsnorm_quantize_kernel_enabled:
-                logger.debug(
-                    "Running Quantized MLP kernel with sequence-parallel RMSnorm-Quantize kernel!"
-                )
+                # logger.debug(
+                #     "Running Quantized MLP kernel with sequence-parallel RMSnorm-Quantize kernel!"
+                # )
                 _rmsnorm_quant_fwd_call = nki_jit()(rmsnorm_quant_isa_kernel)
                 quant_rmsnorm_out = torch.zeros(
                     size=(
@@ -1188,9 +1188,9 @@ class NeuronLlamaMLP(nn.Module):
                 )
 
             else:
-                logger.debug(
-                    "Running Quantized MLP kernel with external (native compiler) sequence-parallel RMSnorm!"
-                )
+                # logger.debug(
+                #     "Running Quantized MLP kernel with external (native compiler) sequence-parallel RMSnorm!"
+                # )
                 x = gather_from_sequence_parallel_region(
                     x, self.sequence_dimension, process_group=get_tp_group(self.config)
                 )
@@ -1272,14 +1272,14 @@ class NeuronLlamaMLP(nn.Module):
         else:
             output_tensor = reduce_from_tensor_model_parallel_region(output_tensor)
 
-        logger.debug(f"Quantized MLP output shape {output_tensor.shape}")
+        # logger.debug(f"Quantized MLP output shape {output_tensor.shape}")
         return (output_tensor, residual)
 
     def _kernel_enabled_mlp(self, x, fused_rmsnorm, rmsnorm, residual, adapter_ids):
         fused_residual = residual is not None
-        logger.debug(
-            f"MLP: kernel, fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, logical_neuron_cores={self.logical_neuron_cores}"
-        )
+        # logger.debug(
+        #     f"MLP: kernel, fused_residual={fused_residual}, fused_rmsnorm={fused_rmsnorm}, logical_neuron_cores={self.logical_neuron_cores}"
+        # )
 
         # Choose which kernel to call
         if fused_residual:
@@ -1365,11 +1365,11 @@ class NeuronLlamaMLP(nn.Module):
                 output_tensor, process_group=get_tp_group(self.config)
             )
 
-        logger.debug(f"MLP output shape {output_tensor.shape}")
+        # logger.debug(f"MLP output shape {output_tensor.shape}")
         return (output_tensor, residual)
 
     def _native_mlp(self, x, rmsnorm, adapter_ids=None):
-        logger.debug("MLP: native compiler")
+        # logger.debug("MLP: native compiler")
         # all-gather is done here instead of CPL layers to
         # avoid 2 all-gathers from up and gate projections
 
@@ -1406,12 +1406,12 @@ class NeuronLlamaMLP(nn.Module):
         Wdown = self.down_proj.weight.data
 
         # information printout
-        logger.debug(f"门网络权重形状：{Wgate.shape}; 类型：{type(Wgate)}")
-        logger.debug(f"上网络权重形状：{Wup.shape}")
-        logger.debug(f"下网络权重形状：{Wdown.shape}")
+        # logger.debug(f"门网络权重形状：{Wgate.shape}; 类型：{type(Wgate)}")
+        # logger.debug(f"上网络权重形状：{Wup.shape}")
+        # logger.debug(f"下网络权重形状：{Wdown.shape}")
         # print("gate weight data", Wgate)
         # print("input shape", x.shape[1], x.shape[2])
-        logger.debug(f"输入数据形状：{x.shape}")
+        # logger.debug(f"输入数据形状：{x.shape}")
         # print("batch 0 input data", x[0])
 
         # transpose input x, x is dimenson 1 x 32 x 2048: use the bottom python transpose function
@@ -1424,9 +1424,9 @@ class NeuronLlamaMLP(nn.Module):
         nki_gate_proj_output = torch.zeros((batch_size, sequence_length, output_dimension), dtype=x.dtype, device=x.device)
         for i in range(batch_size):
             mul_result = nki_matmul_tiled_(x_transposed[i], Wgate.T)
-            print(f"Multiplication Result shape: {mul_result.shape}")
+            # print(f"Multiplication Result shape: {mul_result.shape}")
             nki_gate_proj_output[i] = mul_result
-        logger.debug(f"门网络输出形状：{nki_gate_proj_output.shape}")
+        # logger.debug(f"门网络输出形状：{nki_gate_proj_output.shape}")
         # gate_proj_output = nki_matmul_fully_optimized_(x_transposed[0], Wgate, 1, 16, 16)
         # gate_proj_output = nki_matmul_basic_(x_transposed[0], Wgate)
         
@@ -1438,11 +1438,8 @@ class NeuronLlamaMLP(nn.Module):
         # gate_proj_output = self.gate_proj(x)
         # print("Gold Result: ", gate_proj_output)
 
-        gate_proj_output = (
-            nki_gate_proj_output
-            if not is_lora_module(self.gate_proj)
-            else self.gate_proj(x, adapter_ids)
-        )
+        gate_proj_output = nki_gate_proj_output;
+
         # below is the original implementation
         # gate_proj_output = (
         #     self.gate_proj(x)
@@ -1459,10 +1456,11 @@ class NeuronLlamaMLP(nn.Module):
         )
         if __debug__ and SIMPLE_PROFILE: self.wup_time = time.time() - wup_start
 
-        print("Check")
-        print(f"Gate Shape:{gate_proj_output.shape}")
-        print(f"Up Shape:{up_proj_output.shape}")
-        print(f"Intermediate Size: {self.intermediate_size}")
+        # print("Check")
+        # print(f"Gate Shape:{gate_proj_output.shape}")
+        # print(f"Up Shape:{up_proj_output.shape}")
+        # print(f"Intermediate Size: {self.intermediate_size}")
+
         down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
         
         if __debug__ and SIMPLE_PROFILE: wdown_start = time.time()
@@ -1506,7 +1504,7 @@ class NeuronLlamaMLP(nn.Module):
                 f"Wdown={self.total_wdown_time/self.call_count:.6f}s")  
 
 
-        logger.debug(f"MLP output shape {output.shape}")
+        # logger.debug(f"MLP output shape {output.shape}")
         return output
 
     def forward(self, x, rmsnorm=None, residual=None, adapter_ids=None):
@@ -1525,10 +1523,10 @@ class NeuronLlamaMLP(nn.Module):
 
             # TODO: Entrance to Optimization
             # MLP kernel
-            # return self._kernel_enabled_mlp(
-            #     x, fused_rmsnorm, rmsnorm, residual, adapter_ids=adapter_ids
-            # )
-            return (self._native_mlp(x, rmsnorm, adapter_ids=adapter_ids), None)
+            return self._kernel_enabled_mlp(
+                x, fused_rmsnorm, rmsnorm, residual, adapter_ids=adapter_ids
+            )
+            # return (self._native_mlp(x, rmsnorm, adapter_ids=adapter_ids), None)
         else:
             # No kernel
 
@@ -1578,9 +1576,9 @@ class NeuronLlamaAttention(NeuronAttentionBase):
 
         self.sequence_parallel_enabled = self.neuron_config.sequence_parallel_enabled
         self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
-        logger.debug(
-            f"Hello from NeuronLlamaAttention init! Is SP enabled? {self.sequence_parallel_enabled}. Dim? {self.sequence_dimension}"
-        )
+        # logger.debug(
+        #     f"Hello from NeuronLlamaAttention init! Is SP enabled? {self.sequence_parallel_enabled}. Dim? {self.sequence_dimension}"
+        # )
 
         self.init_gqa_properties()
 
@@ -1714,9 +1712,9 @@ class NeuronLlamaDecoderLayer(nn.Module):
             config=config, tensor_model_parallel_group=get_tp_group(config)
         )
         self.mlp = NeuronLlamaMLP(config)
-        logger.debug(
-            f"Instantiating RMSNorm modules with hidden size {config.hidden_size} and EPS {config.rms_norm_eps}"
-        )
+        # logger.debug(
+        #     f"Instantiating RMSNorm modules with hidden size {config.hidden_size} and EPS {config.rms_norm_eps}"
+        # )
         self.input_layernorm = None
         if (
             not config.neuron_config.is_eagle_draft
