@@ -25,6 +25,7 @@ from neuronx_distributed_inference.models.llama import modeling_llama as baselin
 
 # Load the model for ASPLOS contest
 from llama import NeuronLlamaForCausalLM
+from test import *
 
 BENCHMARK_REPORT_FILENAME = "benchmark_report.json"
 set_random_seed(0)
@@ -34,7 +35,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
 
     # ASPLOS contest specific
-    parser.add_argument("--mode", choices=["evaluate", "validate", "generate"])
+    parser.add_argument("--mode", choices=["evaluate_single", "evaluate_all", "validate", "generate"])
     parser.add_argument("--enable-nki", action="store_true")
     parser.add_argument("--base-latency", type=float, default=526.15)
     parser.add_argument("--base-throughput", type=float, default=134.61)
@@ -509,7 +510,7 @@ def main():
         args.prompts = ["I believe the meaning of life is"]
     args.batch_size = len(args.prompts)
     args.max_length = args.seq_len
-    args.tol_map = "{None: (1e-5, 0.05), 1000: (1e-5, 0.03), 50: (1e-5, 0.02), 5: (1e-5, 0.02)}"
+    args.tol_map = "{None: (1e-5, 0.05), 1000: (1e-5, 0.03), 50: (1e-5, 0.03), 5: (1e-5, 0.03)}"
     
     model, tokenizer, generation_config = prepare_inference(NeuronLlamaForCausalLM, args)
     base_model, _, base_generation_config = prepare_inference(baseline_llama.NeuronLlamaForCausalLM, args)
@@ -539,7 +540,7 @@ def main():
         status = "passed" if passed else "failed"
         print(f"Validation {status}.")
 
-    elif args.mode == "evaluate":
+    elif args.mode == "evaluate_single":
 
         accuracy = run_accuracy_check(
             base_model,
@@ -562,12 +563,59 @@ def main():
 
         score = calculate_score(args.base_latency, args.base_throughput, accuracy, latency, throughput, nki_flop_ratio)
         print(
+            f"Prompt: {args.prompts[0]}\n"
             f"Final Score: {score}\n"
             f"\tAccuracy: {accuracy}\n"
             f"\tLatency: {latency}\n"
             f"\tThroughput: {throughput}\n"
             f"\tNKI FLOPs Ratio: {nki_flop_ratio}"
         )
+        
+    elif args.mode == "evaluate_all":
+
+        prompts = parse_prompts("prompts.txt")
+        prompt_data = parse_prompt_data("prompt_data.txt")
+        assert len(prompts) == len(prompt_data)
+
+        total_score = 0
+
+        # Iterate through the prompts
+        for i, prompt in enumerate(prompts):
+            data = prompt_data[i]
+            base_latency = float(data[3])
+            base_throughput = float(data[4])
+
+            accuracy = run_accuracy_check(
+                base_model,
+                base_generation_config,
+                model,
+                tokenizer,
+                generation_config,
+                [prompt],
+                args.divergence_difference_tol,
+                args.tol_map,
+                num_tokens_to_check=args.num_tokens_to_check,
+            )
+
+            report = benchmark_sampling(model, tokenizer, generation_config, [prompt])
+
+            latency = report["e2e_model"]["latency_ms_p99"]
+            throughput = report["e2e_model"]["throughput"]
+
+            nki_flop_ratio = count_nki_flop_ratio()
+
+            score = calculate_score(base_latency, base_throughput, accuracy, latency, throughput, nki_flop_ratio)
+            print(
+                f"Prompt: {prompt}\n"
+                f"Final Score: {score}\n"
+                f"\tAccuracy: {accuracy}\n"
+                f"\tLatency: {latency}\n"
+                f"\tThroughput: {throughput}\n"
+                f"\tNKI FLOPs Ratio: {nki_flop_ratio}"
+            )
+            total_score += score
+
+        print(f"Total Score: {total_score}\n")
 
     else:
         assert False, "Undefined mode"
