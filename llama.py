@@ -997,47 +997,47 @@ class NeuronLlamaMLP(nn.Module):
 
 ######################################################################################################################################################
 
-        B, N, C = x.shape   # For example, B * N = 32, C = 2048
-        M_orig = B * N      # Original M dimension (32)
+        # B, N, C = x.shape   # For example, B * N = 32, C = 2048
+        # M_orig = B * N      # Original M dimension (32)
 
-        # We need M to be a multiple of 128.
-        BLOCK_M = 128
-        M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M  # Next multiple of 128
+        # # We need M to be a multiple of 128.
+        # BLOCK_M = 128
+        # M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M  # Next multiple of 128
 
-        # Flatten x to 2D: [B*N, C]
-        x_flat_padded = x.view(M_orig, C) # was called x_flat
+        # # Flatten x to 2D: [B*N, C]
+        # x_flat_padded = x.view(M_orig, C) # was called x_flat
 
-        # Pad x_flat along dimension 0 if needed.
-        if M_pad > M_orig:
-            pad_rows = M_pad - M_orig
-            pad = torch.zeros(pad_rows, C, dtype=x.dtype, device=x.device)
-            x_flat_padded = torch.cat([x_flat_padded, pad], dim=0)
+        # # Pad x_flat along dimension 0 if needed.
+        # if M_pad > M_orig:
+        #     pad_rows = M_pad - M_orig
+        #     pad = torch.zeros(pad_rows, C, dtype=x.dtype, device=x.device)
+        #     x_flat_padded = torch.cat([x_flat_padded, pad], dim=0)
 
-        # print("input padded shape", lhsT.size())
-        # print("weight transpose shape", rhs.size())
-        gate_weight_T = self.gate_proj.weight.T
+        # # print("input padded shape", lhsT.size())
+        # # print("weight transpose shape", rhs.size())
+        # gate_weight_T = self.gate_proj.weight.T
 
-        # this operation causes the biggest drop in latency
-        x_flat_padded_T = x_flat_padded.T   
+        # # this operation causes the biggest drop in latency
+        # x_flat_padded_T = x_flat_padded.T   
 
-        # output_padded = nki_matmul_block_free_dimension_(x_flat_padded_T, gate_weight_T)
-        print("x_T shape, weight_T shape", x_flat_padded_T.size(), gate_weight_T.size())
-        output_padded = nki_matmul_fully_optimized_(x_flat_padded_T, gate_weight_T)
-        output_flat = output_padded[:M_orig, :]
-        gate_proj_output = output_flat.view(B, N, -1)
-        # print("native MLP input shape,size, weight shape,size", x.size(), self.gate_proj.weight.size())
-        # gate_proj_output = torch.matmul(x, self.gate_proj.weight.T)
+        # # output_padded = nki_matmul_block_free_dimension_(x_flat_padded_T, gate_weight_T)
+        # print("x_T shape, weight_T shape", x_flat_padded_T.size(), gate_weight_T.size())
+        # output_padded = nki_matmul_fully_optimized_(x_flat_padded_T, gate_weight_T)
+        # output_flat = output_padded[:M_orig, :]
+        # gate_proj_output = output_flat.view(B, N, -1)
+        # # print("native MLP input shape,size, weight shape,size", x.size(), self.gate_proj.weight.size())
 
-        print("nki_gate_proj_output", gate_proj_output.shape)
+        gate_proj_output = torch.matmul(x, self.gate_proj.weight.T)
+        # print("nki_gate_proj_output", gate_proj_output.shape)
 
 ######################################################################################################################################################
 
-        # up_proj_output = torch.matmul(x, self.up_proj.weight.T)
+        up_proj_output = torch.matmul(x, self.up_proj.weight.T)
 
-        up_weight_T = self.up_proj.weight.T
-        up_output_padded = nki_matmul_block_free_dimension_(x_flat_padded_T, up_weight_T)
-        up_output_flat = up_output_padded[:M_orig, :]
-        up_proj_output = up_output_flat.view(B, N, -1)
+        # up_weight_T = self.up_proj.weight.T
+        # up_output_padded = nki_matmul_block_free_dimension_(x_flat_padded_T, up_weight_T)
+        # up_output_flat = up_output_padded[:M_orig, :]
+        # up_proj_output = up_output_flat.view(B, N, -1)
 
 ######################################################################################################################################################
 
