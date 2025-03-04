@@ -276,8 +276,12 @@ def nki_matmul_block_free_dimension_(lhsT, rhs):
     TILES_IN_BLOCK_M = 1
     TILES_IN_BLOCK_N = 2
 
+
     BLOCK_M = TILE_M * TILES_IN_BLOCK_M  # 256
     BLOCK_N = TILE_N * TILES_IN_BLOCK_N  # 1024
+
+    print("M, N, K: ", M, N, K)
+    print("Block M, Block N: ", BLOCK_M, BLOCK_N)
 
     # the size has to be multiple of block size
     assert M % BLOCK_M == 0
@@ -997,50 +1001,51 @@ class NeuronLlamaMLP(nn.Module):
 
 ######################################################################################################################################################
 
-        # B, N, C = x.shape   # For example, B * N = 32, C = 2048
-        # M_orig = B * N      # Original M dimension (32)
+        B, N, C = x.shape   # For example, B * N = 32, C = 2048
+        M_orig = B * N      # Original M dimension (32)
 
-        # # We need M to be a multiple of 128.
-        # BLOCK_M = 128
-        # M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M  # Next multiple of 128
+        # We need M to be a multiple of 128.
+        BLOCK_M = 128
+        M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M  # Next multiple of 128
 
-        # # Flatten x to 2D: [B*N, C]
-        # x_flat_padded = x.view(M_orig, C) # was called x_flat
+        # Flatten x to 2D: [B*N, C]
+        x_flat_padded = x.view(M_orig, C) # was called x_flat
+        gate_weight_T = self.gate_proj.weight.T
 
-        # # Pad x_flat along dimension 0 if needed.
-        # if M_pad > M_orig:
-        #     pad_rows = M_pad - M_orig
-        #     pad = torch.zeros(pad_rows, C, dtype=x.dtype, device=x.device)
-        #     x_flat_padded = torch.cat([x_flat_padded, pad], dim=0)
+        # Pad x_flat along dimension 0 if needed.
+        if M_pad > M_orig:
+            pad_rows = M_pad - M_orig
+            pad = torch.zeros(pad_rows, C, dtype=x.dtype, device=x.device)
+            x_flat_padded = torch.cat([x_flat_padded, pad], dim=0)
 
-        # # print("input padded shape", lhsT.size())
-        # # print("weight transpose shape", rhs.size())
-        # gate_weight_T = self.gate_proj.weight.T
+        x_flat_padded_T = x_flat_padded.T
+        MDIM = x_flat_padded.shape[0]
+        NDIM = self.gate_proj.weight.shape[0]
+        KDIM = self.gate_proj.weight.shape[1]
 
-        # # this operation causes the biggest drop in latency
-        # x_flat_padded_T = x_flat_padded.T   
+        Mtile = MDIM // 128
+        Ntile = NDIM // 512
+        Ktile = KDIM // 128 
 
-        # # output_padded = nki_matmul_block_free_dimension_(x_flat_padded_T, gate_weight_T)
-        # print("x_T shape, weight_T shape", x_flat_padded_T.size(), gate_weight_T.size())
-        # output_padded = nki_matmul_fully_optimized_(x_flat_padded_T, gate_weight_T)
-        # output_flat = output_padded[:M_orig, :]
-        # gate_proj_output = output_flat.view(B, N, -1)
-        # # print("native MLP input shape,size, weight shape,size", x.size(), self.gate_proj.weight.size())
+        # input transpose operation causes the biggest drop in latency
 
-        gate_proj_output = torch.matmul(x, self.gate_proj.weight.T)
-        # print("nki_gate_proj_output", gate_proj_output.shape)
+        # output_padded = nki_matmul_block_free_dimension_(x_flat_padded_T, gate_weight_T)
+        output_padded = nki_matmul_fully_optimized_(x_flat_padded_T, gate_weight_T, Mtile, Ntile, Ktile)        
+        output_flat = output_padded[:M_orig, :]
+        gate_proj_output = output_flat.view(B, N, -1)
 
-######################################################################################################################################################
-
-        up_proj_output = torch.matmul(x, self.up_proj.weight.T)
-
-        # up_weight_T = self.up_proj.weight.T
-        # up_output_padded = nki_matmul_block_free_dimension_(x_flat_padded_T, up_weight_T)
-        # up_output_flat = up_output_padded[:M_orig, :]
-        # up_proj_output = up_output_flat.view(B, N, -1)
+        # gate_proj_output = torch.matmul(x, self.gate_proj.weight.T)
 
 ######################################################################################################################################################
 
+        # up_proj_output = torch.matmul(x, self.up_proj.weight.T)
+
+        up_weight_T = self.up_proj.weight.T
+        up_output_padded = nki_matmul_fully_optimized_(x_flat_padded_T, up_weight_T, Mtile, Ntile, Ktile)        
+        up_output_flat = up_output_padded[:M_orig, :]
+        up_proj_output = up_output_flat.view(B, N, -1)
+
+######################################################################################################################################################
 
         down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
         # output = torch.matmul(down_proj_input, self.down_proj.weight.T)
@@ -1166,22 +1171,22 @@ class NeuronLlamaAttention(NeuronAttentionBase):
                 # We include it here for compatibility with other scaling types.
                 self.rotary_emb = LlamaRotaryEmbedding(self.config)
 
-    def scaled_qk(self, Q, K, attention_mask):
-        bs, head, sequence, dimension = Q.size()
-        _, head_k, sequence_k, dimension_k = K.size()
-        result = torch.zeros((bs, head, sequence, sequence_k), device = Q.device, dtype=Q.dtype)
+    # def scaled_qk(self, Q, K, attention_mask):
+    #     bs, head, sequence, dimension = Q.size()
+    #     _, head_k, sequence_k, dimension_k = K.size()
+    #     result = torch.zeros((bs, head, sequence, sequence_k), device = Q.device, dtype=Q.dtype)
 
-        for i in range(bs):
-            for j in range(head):
-                temp_q = Q[i, j, :, :]
-                temp_k = (K.transpose(2, 3))[i, j, :, :]
-                temp = matmul_test(temp_q.T, temp_k, sequence, sequence_k)
-                # temp = matmul_test(temp_q.T, temp_k)
-                temp = temp / math.sqrt(self.head_dim)
-                result[i, j, :, :] = temp
-        QK = result
-        QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
-        return QK
+    #     for i in range(bs):
+    #         for j in range(head):
+    #             temp_q = Q[i, j, :, :]
+    #             temp_k = (K.transpose(2, 3))[i, j, :, :]
+    #             temp = matmul_test(temp_q.T, temp_k, sequence, sequence_k)
+    #             # temp = matmul_test(temp_q.T, temp_k)
+    #             temp = temp / math.sqrt(self.head_dim)
+    #             result[i, j, :, :] = temp
+    #     QK = result
+    #     QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
+    #     return QK
 
 # TODO: Modularize RotaryEmbedding. See how HF transformers does it in 4.43.
 class Llama3RotaryEmbedding(nn.Module):
