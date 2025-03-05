@@ -24,7 +24,7 @@ import gc
 import logging
 import math
 import numpy as np
-
+import time
 from typing import List, Optional, Tuple, Type
 
 import torch
@@ -89,10 +89,7 @@ import os
 from torch_xla.core import xla_model as xm
 
 
-# import time
-
 SIMPLE_PROFILE = False
-
 _LLAMA_MODULE_MAP = {}
 
 # logger = logging.getLogger("Neuron")
@@ -102,7 +99,6 @@ _LLAMA_MODULE_MAP = {}
 # formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 # handler.setFormatter(formatter)
 # logger.addHandler(handler)
-
 
 @nki.jit
 def tensor_transpose2D_kernel_(in_tensor, shape2D):
@@ -139,109 +135,6 @@ def tensor_transpose2D_kernel_(in_tensor, shape2D):
     return out_tensor
 
 @nki.jit
-def nki_matmul_basic_(lhsT, rhs):
-    """NKI kernel to compute a 64x128x512 matrix multiplication operation
-
-    Args:
-        lhsT: an input tensor of shape [128,64], a left hand side argument of the
-        matrix multiplication, delivered transposed for optimal performance
-        rhs: an input tensor of shape [128,512], a right hand side argument of the
-        matrix multiplication
-    Returns:
-        result: the resulting output tensor of shape [64,512]
-    """
-    # result = nl.ndarray((64, 512), dtype=lhsT.dtype, buffer=nl.shared_hbm)
-    result = nl.ndarray((32, 8192), dtype=lhsT.dtype, buffer=nl.shared_hbm)
-
-
-    # Defining indexes for input LHS.T
-    # - Note: here we take LayoutConstraint #1 into account:
-    # "For MatMult, contraction axis must be mapped to P-dim"
-    i_lhsT_p, i_lhsT_f = nl.mgrid[0:2048, 0:32]
-
-    # Defining indexes for input RHS
-    # - Note: here we take LayoutConstraint #1 into account:
-    # "For MatMult, contraction axis must be mapped to P-dim"
-    i_rhs_p, i_rhs_f = nl.mgrid[0:2048, 0:8192]
-
-    # Defining indexes for the output ([64,128]@[128,512] -> [64,512])
-    i_out_p, i_out_f = nl.mgrid[0:32, 0:8192]
-
-    # Loading the inputs (HBM->SBUF)
-    # Note: here we take Tile dtype definition into account,
-    # which forces P-dim as the left most index
-    lhs_tile = nl.load(lhsT[i_lhsT_p, i_lhsT_f])
-    rhs_tile = nl.load(rhs[i_rhs_p, i_rhs_f])
-
-    # Perform the matrix-multiplication
-    # Note1: We set transpose_x to True, to indicate that the LHS input is transposed
-    # Note2: A NKI matmul instruction always writes to PSUM in float32 data-type
-    result_psum = nl.matmul(lhs_tile, rhs_tile, transpose_x=True)
-
-    # Copy the result from PSUM back to SBUF, and cast to expected output data-type
-    result_sbuf = nl.copy(result_psum, dtype=result.dtype)
-
-    # The result of a [64,128] x [128,512] matrix multiplication has a shape of [64, 512].
-    # This dictates which indices to use to address the result tile.
-    nl.store(result[i_out_p, i_out_f], value=result_sbuf)
-
-    return result
-
-@nki.jit
-def nki_matmul_tiled_(lhsT, rhs):
-    """NKI kernel to compute a matrix multiplication operation in a tiled manner
-
-    Args:
-        lhsT: an input tensor of shape [K,M], where both K and M are multiples for
-            128.  It is the left-hand-side argument of the matrix multiplication,
-            delivered transposed for optimal performance.
-        rhs: an input tensor of shape [K,N], where K is a multiple of 128, and N
-            is a multiple of 512.  It is the right-hand-side argument of the matrix
-            multiplication.
-    Returns:
-        result: the resulting output tensor of shape [M,N]
-    """
-
-    K, M = lhsT.shape
-    # print(K, M)
-    K_, N = rhs.shape
-    # print(K_, N)
-    assert K == K_, "lhsT and rhs must have the same contraction dimension"
-    result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
-
-    # TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-    TILE_M = 1
-    TILE_K = nl.tile_size.pmax  # 128
-    TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-
-    # Use affine_range to loop over tiles
-    for m in nl.affine_range(M // TILE_M):
-        for n in nl.affine_range(N // TILE_N):
-            # Allocate a tensor in PSUM
-            res_psum = nl.zeros((TILE_M, TILE_N), nl.float32, buffer=nl.psum)
-
-            for k in nl.affine_range(K // TILE_K):
-                # Declare the tiles on SBUF
-                lhsT_tile = nl.ndarray((TILE_K, TILE_M), dtype=lhsT.dtype, buffer=nl.sbuf)
-                rhs_tile = nl.ndarray((TILE_K, TILE_N), dtype=rhs.dtype, buffer=nl.sbuf)
-
-                # Load tiles from lhsT and rhs
-                lhsT_tile[...] = nl.load(lhsT[k * TILE_K:(k + 1) * TILE_K,
-                                            m * TILE_M:(m + 1) * TILE_M])
-                rhs_tile[...] = nl.load(rhs[k * TILE_K:(k + 1) * TILE_K,
-                                            n * TILE_N:(n + 1) * TILE_N])
-
-                # Accumulate partial-sums into PSUM
-                res_psum += nl.matmul(lhsT_tile[...], rhs_tile[...], transpose_x=True)
-
-            # Copy the result from PSUM back to SBUF, and cast to expected output data-type
-            res_sb = nl.copy(res_psum, dtype=result.dtype)
-            nl.store(result[m * TILE_M:(m + 1) * TILE_M, n * TILE_N:(n + 1) * TILE_N],
-                value=res_sb)
-    # logger.debug("nki函数被调用")
-    return result
-
-@nki.jit
 def matmul_test(lhs_small, rhs_small, size1, size2):
     nki_lhs_small = nl.load(lhs_small[:, :])
     nki_rhs_small = nl.load(rhs_small[:, :])
@@ -254,79 +147,149 @@ def matmul_test(lhs_small, rhs_small, size1, size2):
     return result
 
 @nki.jit
-def nki_matmul_block_free_dimension_(lhsT, rhs):
-    # print("K dim, k_ dim", lhsT.shape, rhs.shape)
+def nki_matmul_fully_optimized_spmd_(
+    lhsT,
+    rhs,
+    TILES_IN_BLOCK_M=1,
+    TILES_IN_BLOCK_N=16,
+    TILES_IN_BLOCK_K=8,
+    # Number of parallel “chunks” (SPMD workers) we want along the M dimension:
+    spmd_m=2
+):
+    """
+    SPMD variant of your matmul kernel, distributing the M blocks among `spmd_m` workers.
+    Each worker runs the same code, but only processes a slice of the M dimension.
+    """
 
+    # 1) Validate shapes
     K, M = lhsT.shape
     K_, N = rhs.shape
-  
     assert K == K_, "lhsT and rhs must have the same contraction dimension"
+
+    # 2) Allocate the final result in shared HBM
     result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
-    TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-    TILE_K = nl.tile_size.pmax  # 128
-    TILE_N = nl.tile_size.gemm_moving_fmax  # 512
+    # 3) Define tile sizes (as before)
+    TILE_M = nl.tile_size.gemm_stationary_fmax  # usually 128
+    TILE_K = nl.tile_size.pmax                  # usually 128
+    TILE_N = nl.tile_size.gemm_moving_fmax      # usually 512
 
-    # Define the indices (shape) of the tiles
-    i_lhsT = nl.mgrid[0:TILE_K, 0:TILE_M]
-    i_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
-    i_res = nl.mgrid[0:TILE_M, 0:TILE_N]
+    # 4) Compute the block sizes
+    BLOCK_M = TILE_M * TILES_IN_BLOCK_M
+    BLOCK_N = TILE_N * TILES_IN_BLOCK_N
+    BLOCK_K = TILE_K * TILES_IN_BLOCK_K
 
-    # Configuring the blocking size for the free dimensions
-    TILES_IN_BLOCK_M = 1
-    TILES_IN_BLOCK_N = 2
+    # 5) Ensure the global shapes are multiples of these blocks
+    assert M % BLOCK_M == 0, "M not divisible by BLOCK_M"
+    assert N % BLOCK_N == 0, "N not divisible by BLOCK_N"
+    assert K % BLOCK_K == 0, "K not divisible by BLOCK_K"
 
+    # 6) Count how many blocks along each dimension
+    NUM_BLOCK_M = M // BLOCK_M  # total blocks in M dimension
+    NUM_BLOCK_N = N // BLOCK_N  # total blocks in N dimension
+    NUM_BLOCK_K = K // BLOCK_K  # total blocks in K dimension
 
-    BLOCK_M = TILE_M * TILES_IN_BLOCK_M  # 256
-    BLOCK_N = TILE_N * TILES_IN_BLOCK_N  # 1024
+    # ------------------------------------------------------------------
+    # 7) Figure out which sub-range of M-blocks *this SPMD worker* handles
+    #    We assume we want to distribute M across spmd_m cores.
+    #    So we chunk the M-block range [0..NUM_BLOCK_M) into spmd_m pieces.
+    # ------------------------------------------------------------------
+    # This kernel’s "worker id" along dimension 0:
+    my_m_id = nl.program_id(0)  # 0,1,... up to (spmd_m-1)
 
-    print("M, N, K: ", M, N, K)
-    print("Block M, Block N: ", BLOCK_M, BLOCK_N)
+    # Blocks per worker in M dimension:
+    blocks_per_worker = NUM_BLOCK_M // spmd_m
+    assert (NUM_BLOCK_M % spmd_m) == 0, \
+        "For simplicity, we assume NUM_BLOCK_M is divisible by spmd_m"
 
-    # the size has to be multiple of block size
-    assert M % BLOCK_M == 0
-    assert N % BLOCK_N == 0
+    start_m = my_m_id * blocks_per_worker
+    end_m   = (my_m_id + 1) * blocks_per_worker
 
-    # Loop over blocks over the M dimension
-    for m in nl.affine_range(M // BLOCK_M):
-        # Load TILES_IN_BLOCK_M columns tiles from lhsT
-        lhsT_tiles = nl.ndarray(
-            (TILES_IN_BLOCK_M, K // TILE_K, nl.par_dim(TILE_K), TILE_M),
+    # 8) Outer loop on N dimension
+    for n in nl.affine_range(NUM_BLOCK_N):
+
+        # We’ll store partial results in SBUF as you already do
+        result_tiles = nl.zeros(
+            (blocks_per_worker, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N,
+             nl.par_dim(TILE_M), TILE_N),
             dtype=lhsT.dtype,
-            buffer=nl.sbuf)
-        for bm in nl.affine_range(TILES_IN_BLOCK_M):
-            for k in nl.affine_range(K // TILE_K):
-                lhsT_tiles[bm, k, i_lhsT.p, i_lhsT.x] = nl.load(
-                    lhsT[k * TILE_K + i_lhsT.p,
-                        (m * TILES_IN_BLOCK_M + bm) * TILE_M + i_lhsT.x])
+            buffer=nl.sbuf
+        )
 
-        for n in nl.affine_range(N // BLOCK_N):
-            # Load TILES_IN_BLOCK_N columns from rhs
+        # 9) Loop over K dimension
+        for k_blk in nl.sequential_range(NUM_BLOCK_K):
+            # -- Load tiles from RHS
+            i_rhs = nl.mgrid[0:TILE_K, 0:BLOCK_N]
             rhs_tiles = nl.ndarray(
-                (TILES_IN_BLOCK_N, K // TILE_K, nl.par_dim(TILE_K), TILE_N),
+                (TILES_IN_BLOCK_K, nl.par_dim(TILE_K), BLOCK_N),
                 dtype=rhs.dtype,
-                buffer=nl.sbuf)
-            for bn in nl.affine_range(TILES_IN_BLOCK_N):
-                for k in nl.affine_range(K // TILE_K):
-                    rhs_tiles[bn, k, i_rhs.p, i_rhs.x] = nl.load(
-                        rhs[k * TILE_K + i_rhs.p,
-                            (n * TILES_IN_BLOCK_N + bn) * TILE_N + i_rhs.x])
+                buffer=nl.sbuf
+            )
 
-            for bm in nl.affine_range(TILES_IN_BLOCK_M):
+            for bk_r in nl.affine_range(TILES_IN_BLOCK_K):
+                rhs_tiles[bk_r, i_rhs.p, i_rhs.x] = nl.load(
+                    rhs[(TILES_IN_BLOCK_K * k_blk + bk_r) * TILE_K + i_rhs.p,
+                        BLOCK_N * n + i_rhs.x]
+                )
+
+            # 10) Now loop over *our subset* of M blocks
+            for local_m_index in nl.affine_range(blocks_per_worker):
+                # The global M block index this worker is handling
+                m = start_m + local_m_index
+
+                # -- Load tiles from LHS^T
+                i_lhsT = nl.mgrid[0:TILE_K, 0:BLOCK_M]
+                lhsT_tiles = nl.ndarray(
+                    (TILES_IN_BLOCK_K, nl.par_dim(TILE_K), BLOCK_M),
+                    dtype=lhsT.dtype,
+                    buffer=nl.sbuf
+                )
+                for bk_l in nl.affine_range(TILES_IN_BLOCK_K):
+                    lhsT_tiles[bk_l, i_lhsT.p, i_lhsT.x] = nl.load(
+                        lhsT[(TILES_IN_BLOCK_K * k_blk + bk_l) * TILE_K + i_lhsT.p,
+                             BLOCK_M * m + i_lhsT.x]
+                    )
+
+                # -- Perform the partial matmul
+                i_lhsT_mm = nl.mgrid[0:TILE_K, 0:TILE_M]
+                i_rhs_mm  = nl.mgrid[0:TILE_K, 0:TILE_N]
+                i_res_mm  = nl.mgrid[0:TILE_M, 0:TILE_N]
                 for bn in nl.affine_range(TILES_IN_BLOCK_N):
-                # Allocate a tensor in PSUM
-                    res_psum = nl.zeros((TILE_M, TILE_N), nl.float32, buffer=nl.psum)
-                    for k in nl.affine_range(K // TILE_K):
-                        # Accumulate partial-sums into PSUM
-                        res_psum += nl.matmul(lhsT_tiles[bm, k, i_lhsT.p, i_lhsT.x],
-                                            rhs_tiles[bn, k, i_rhs.p, i_rhs.x],
-                                            transpose_x=True)
+                    for bm in nl.affine_range(TILES_IN_BLOCK_M):
+                        res_tile = nl.zeros((TILE_M, TILE_N),
+                                            dtype=nl.float32, buffer=nl.psum)
+                        for bk in nl.affine_range(TILES_IN_BLOCK_K):
+                            res_tile[...] += nisa.nc_matmul(
+                                lhsT_tiles[bk, i_lhsT_mm.p, bm*TILE_M + i_lhsT_mm.x],
+                                rhs_tiles[bk, i_rhs_mm.p, bn*TILE_N + i_rhs_mm.x]
+                            )
+                        # Accumulate partial sums into SBUF tile
+                        result_tiles[local_m_index, bm, bn,
+                                     i_res_mm.p, i_res_mm.x] += \
+                            res_tile[i_res_mm.p, i_res_mm.x]
 
-                    # Copy the result from PSUM back to SBUF, and cast to expected output data-type
-                    res_sb = nl.copy(res_psum, dtype=result.dtype)
-                    nl.store(result[(m * TILES_IN_BLOCK_M + bm) * TILE_M + i_res.p,
-                                    (n * TILES_IN_BLOCK_N + bn) * TILE_N + i_res.x],
-                            value=res_sb)
+        # 11) Write final tiles from SBUF → shared HBM
+        for local_m_index in nl.affine_range(blocks_per_worker):
+            # The global M block index
+            m = start_m + local_m_index
+            for bm in nl.affine_range(TILES_IN_BLOCK_M):
+                i_res        = nl.mgrid[0:TILE_K, 0:TILE_N]
+                i_res_packed = nl.mgrid[0:TILE_K, 0:BLOCK_N]
+                result_packed = nl.ndarray((TILE_K, BLOCK_N),
+                                           dtype=result_tiles.dtype,
+                                           buffer=nl.sbuf)
+
+                # coalesce result tiles for better DMA performance
+                for bn in nl.affine_range(TILES_IN_BLOCK_N):
+                    result_packed[i_res.p, bn*TILE_N + i_res.x] = nl.copy(
+                        result_tiles[local_m_index, bm, bn, i_res.p, i_res.x]
+                    )
+                # Now store from SBUF to final result in HBM
+                nl.store(
+                    result[(TILES_IN_BLOCK_M*m + bm)*TILE_K + i_res_packed.p,
+                           BLOCK_N*n + i_res_packed.x],
+                    value=result_packed[i_res_packed.p, i_res_packed.x]
+                )
 
     return result
 
@@ -432,18 +395,6 @@ def nki_matmul_fully_optimized_(
                             value=result_packed[i_res_packed.p, i_res_packed.x])
 
     return result
-
-
-@nki.jit
-def nki_matmul(input_tensor, weight_tensor, output_tensor):
-    # # output_tensor = nl.ndarray((1, 32, 4096), dtype=input_tensor.dtype, buffer=nl.shared_hbm)
-    # # output_tensor = nl.ndarray((input_tensor.shape[0], input_tensor.shape[1], weight_tensor.shape[1]), dtype=input_tensor.dtype, buffer=nl.shared_hbm)
-
-    # for batch in range (input_tensor.shape[0]):
-    #     output_tensor = nki_matmul_fully_optimized_(input_tensor[batch], weight_tensor)
-    
-    # return output_tensor
-    pass
 
 @nki.jit
 def nki_rmsnorm_kernel(a_tensor, g_tensor, eps):
@@ -1004,9 +955,9 @@ class NeuronLlamaMLP(nn.Module):
         B, N, C = x.shape   # For example, B * N = 32, C = 2048
         M_orig = B * N      # Original M dimension (32)
 
-        # We need M to be a multiple of 128.
-        BLOCK_M = 128
-        M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M  # Next multiple of 128
+        # We need M to be a multiple of 256 = 128 x 2core.
+        BLOCK_M = 256
+        M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M  # Next multiple of 256
 
         # Flatten x to 2D: [B*N, C]
         x_flat_padded = x.view(M_orig, C) # was called x_flat
@@ -1023,14 +974,14 @@ class NeuronLlamaMLP(nn.Module):
         NDIM = self.gate_proj.weight.shape[0]
         KDIM = self.gate_proj.weight.shape[1]
 
-        Mtile = MDIM // 128
+        Mtile = MDIM // 128 // 2 ### 2 cores
         Ntile = NDIM // 512
         Ktile = KDIM // 128 
 
         # input transpose operation causes the biggest drop in latency
 
         # output_padded = nki_matmul_block_free_dimension_(x_flat_padded_T, gate_weight_T)
-        output_padded = nki_matmul_fully_optimized_(x_flat_padded_T, gate_weight_T, Mtile, Ntile, Ktile)        
+        output_padded = nki_matmul_fully_optimized_spmd_[nl.nc(2)](x_flat_padded_T, gate_weight_T, Mtile, Ntile, Ktile, 2)        
         output_flat = output_padded[:M_orig, :]
         gate_proj_output = output_flat.view(B, N, -1)
 
@@ -1041,13 +992,48 @@ class NeuronLlamaMLP(nn.Module):
         # up_proj_output = torch.matmul(x, self.up_proj.weight.T)
 
         up_weight_T = self.up_proj.weight.T
-        up_output_padded = nki_matmul_fully_optimized_(x_flat_padded_T, up_weight_T, Mtile, Ntile, Ktile)        
+        up_output_padded = nki_matmul_fully_optimized_spmd_[nl.nc(2)](x_flat_padded_T, up_weight_T, Mtile, Ntile, Ktile, 2)        
         up_output_flat = up_output_padded[:M_orig, :]
         up_proj_output = up_output_flat.view(B, N, -1)
 
 ######################################################################################################################################################
 
         down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
+        # print("Down proj input shape: ", down_proj_input.size()) # 1 x [128, 256, 640] x 4096
+
+###################################################################################################################################################### 
+        
+        # BD, ND, CD = down_proj_input.shape   # For example, B * N = 32, C = 2048
+        # MD_orig = BD * ND      # Original M dimension (32)
+
+        # MD_pad = math.ceil(MD_orig / BLOCK_M) * BLOCK_M  # Next multiple of 128
+
+        # # Flatten x to 2D: [B*N, C]
+        # down_proj_input_flat = down_proj_input.view(M_orig, CD) # flat
+        # down_weight_T = self.down_proj.weight.T
+
+        # # Pad x_flat along dimension 0 if needed.
+        # if MD_pad > MD_orig:
+        #     pad_rows = M_pad - M_orig
+        #     pad = torch.zeros(pad_rows, C, dtype=x.dtype, device=x.device)
+        #     x_flat_padded = torch.cat([x_flat_padded, pad], dim=0)
+
+        # x_flat_padded_T = x_flat_padded.T
+        # MDIM = x_flat_padded.shape[0]
+        # NDIM = self.gate_proj.weight.shape[0]
+        # KDIM = self.gate_proj.weight.shape[1]
+
+        # Mtile = MDIM // 128
+        # Ntile = NDIM // 512
+        # Ktile = KDIM // 128 
+
+        # # input transpose operation causes the biggest drop in latency
+
+        # # output_padded = nki_matmul_block_free_dimension_(x_flat_padded_T, gate_weight_T)
+        # output_padded = nki_matmul_fully_optimized_(x_flat_padded_T, gate_weight_T, Mtile, Ntile, Ktile)        
+        # output_flat = output_padded[:M_orig, :]
+        # gate_proj_output = output_flat.view(B, N, -1)
+
         # output = torch.matmul(down_proj_input, self.down_proj.weight.T)
         output = (
             self.down_proj(down_proj_input)
