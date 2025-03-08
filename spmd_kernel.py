@@ -30,7 +30,7 @@ def nki_matmul_fully_optimized_spmd_(
     SPMD variant of your matmul kernel, distributing the M blocks among `spmd_m` workers.
     Each worker runs the same code, but only processes a slice of the M dimension.
     """
-
+    debug_array = nl.ndarray((2,), dtype=nl.int32, buffer=nl.shared_hbm)
     # 1) Validate shapes
     K, M = lhsT.shape
     K_, N = rhs.shape
@@ -66,7 +66,7 @@ def nki_matmul_fully_optimized_spmd_(
     # ------------------------------------------------------------------
     # This kernel’s "worker id" along dimension 0:
     my_m_id = nl.program_id(0)  # 0,1,... up to (spmd_m-1)
-    # print("Hello how many times?")
+    debug_array[my_m_id] = my_m_id
 
     # Blocks per worker in M dimension:
     blocks_per_worker = NUM_BLOCK_M // spmd_m
@@ -162,6 +162,7 @@ def nki_matmul_fully_optimized_spmd_(
                     value=result_packed[i_res_packed.p, i_res_packed.x]
                 )
 
+    # print("debug array: ", debug_array)
     return result
 
 def test_matmul_SPMD(device = xm.xla_device()):
@@ -196,7 +197,6 @@ def test_matmul_SPMD(device = xm.xla_device()):
     output_padded = nki_matmul_fully_optimized_spmd_[nl.nc(2)](x_flat_padded.T, gate_weight.T, Mtile, Ntile, Ktile, 2)
     output_flat = output_padded[:M_orig, :]
     gate_proj_output = output_flat.view(B, N, -1)
-
     check_matmul_match(x, gate_weight.T, gate_proj_output)
 
     return gate_proj_output
@@ -466,7 +466,7 @@ def prepare_mlp_gating_input(device = xm.xla_device()):
 
 def prepare_matmul_SPMD_input(device = xm.xla_device()):
     # input
-    x = torch.rand((1, 32, 2048), dtype=torch.bfloat16, device=device)
+    x = torch.rand((2, 56, 2048), dtype=torch.bfloat16, device=device)
     # weights
     gate_weight = torch.rand((8192, 2048), dtype=torch.bfloat16, device=device)
     up_weight = torch.rand((8192, 2048), dtype=torch.bfloat16, device=device)
@@ -476,12 +476,12 @@ def main():
     # use Trn1 instance
     device = xm.xla_device()
 
-    # # test spmd optimized matmul
-    # spmd_matmul_result = test_matmul_SPMD(device)
-    # print(f"fully_optimized_output_shape={spmd_matmul_result.size()}")
+    # test spmd optimized matmul
+    spmd_matmul_result = test_matmul_SPMD(device)
+    print(f"fully_optimized_output_shape={spmd_matmul_result.size()}")
 
-    # test fused gate and up proj
-    test_fused_gate_up_proj()
+    # # test fused gate and up proj
+    # test_fused_gate_up_proj()
 
 if __name__ == "__main__":
     main()
