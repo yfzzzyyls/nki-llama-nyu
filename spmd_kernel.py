@@ -386,6 +386,7 @@ def test_fused_gate_up_proj(device = xm.xla_device()):
     Ktile = KDIM // 128
 
     # -- Single kernel call for both gate & up
+    start = time.time()
     big_output_padded = nki_matmul_fully_optimized_spmd_proj_fused[
         nl.nc(2)
     ](
@@ -396,7 +397,9 @@ def test_fused_gate_up_proj(device = xm.xla_device()):
         Ktile,
         2    # spmd_m=2
     )
-
+    end = time.time()
+    print("total time: ", end - start)
+    
     # big_output_padded has shape (M_pad, out1+out2)
     # Slice off the padding, if any
     big_output_flat = big_output_padded[:M_orig, :]  # (M_orig, out1+out2)
@@ -476,12 +479,12 @@ def main():
     # use Trn1 instance
     device = xm.xla_device()
 
-    # test spmd optimized matmul
-    spmd_matmul_result = test_matmul_SPMD(device)
-    print(f"fully_optimized_output_shape={spmd_matmul_result.size()}")
+    # # test spmd optimized matmul
+    # spmd_matmul_result = test_matmul_SPMD(device)
+    # print(f"fully_optimized_output_shape={spmd_matmul_result.size()}")
 
     # # test fused gate and up proj
-    # test_fused_gate_up_proj()
+    test_fused_gate_up_proj()
 
 if __name__ == "__main__":
     main()
