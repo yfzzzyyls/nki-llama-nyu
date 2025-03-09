@@ -135,508 +135,786 @@ class FlashAttentionStrategy(Enum):
     SHARDED_KERNEL = 2
 
 
-# class NeuronAttentionBase(nn.Module):
-#     """
-#     This base attention class implements the core Neuron related adaptation including
-#     1. replaces the q_proj, k_proj, v_proj with column parallel layer
-#     2. replaces the o_proj with row parallel layer
-#     3. update self.num_head to be self.num_head / tp_degree
-#     4. update self.num_key_value_heads to be self.num_key_value_heads / tp_degree
-#     5. update forward() method to adjust to changes from self.num_head
-#     """
+class NeuronAttentionBase(nn.Module):
+    """
+    This base attention class implements the core Neuron related adaptation including
+    1. replaces the q_proj, k_proj, v_proj with column parallel layer
+    2. replaces the o_proj with row parallel layer
+    3. update self.num_head to be self.num_head / tp_degree
+    4. update self.num_key_value_heads to be self.num_key_value_heads / tp_degree
+    5. update forward() method to adjust to changes from self.num_head
+    """
 
-#     def __init__(self, tensor_model_parallel_group: Optional[ProcessGroup] = None):
-#         super().__init__()
+    def __init__(self, tensor_model_parallel_group: Optional[ProcessGroup] = None):
+        super().__init__()
 
-#         if tensor_model_parallel_group is not None:
-#             self.tensor_model_parallel_group = tensor_model_parallel_group
-#             self.rank_util = SPMDRank(world_size=self.tensor_model_parallel_group.size())
-#         elif nxd.parallel_layers.parallel_state.model_parallel_is_initialized():
-#             self.tensor_model_parallel_group = (
-#                 nxd.parallel_layers.parallel_state.get_tensor_model_parallel_group()
-#             )
-#             self.rank_util = SPMDRank(world_size=self.tensor_model_parallel_group.size())
-#         else:
-#             # CPU flow doesn need rank_util and TP group now
-#             self.tensor_model_parallel_group = None
-#             self.rank_util = None
+        if tensor_model_parallel_group is not None:
+            self.tensor_model_parallel_group = tensor_model_parallel_group
+            self.rank_util = SPMDRank(world_size=self.tensor_model_parallel_group.size())
+        elif nxd.parallel_layers.parallel_state.model_parallel_is_initialized():
+            self.tensor_model_parallel_group = (
+                nxd.parallel_layers.parallel_state.get_tensor_model_parallel_group()
+            )
+            self.rank_util = SPMDRank(world_size=self.tensor_model_parallel_group.size())
+        else:
+            # CPU flow doesn need rank_util and TP group now
+            self.tensor_model_parallel_group = None
+            self.rank_util = None
 
-#         self.is_causal = True
-#         self.num_key_value_groups = None
-#         self.num_key_value_heads = None
-#         self.num_heads = None
-#         self.rotary_emb = None
-#         self.o_proj = None
-#         self.qkv_proj = None
-#         self.bias = False
-#         self.k_layernorm = None
-#         self.q_layernorm = None
-#         self.qk_layernorm = False
-#         self.rms_norm_eps = None
+        self.is_causal = True
+        self.num_key_value_groups = None
+        self.num_key_value_heads = None
+        self.num_heads = None
+        self.rotary_emb = None
+        self.o_proj = None
+        self.qkv_proj = None
+        self.bias = False
+        self.k_layernorm = None
+        self.q_layernorm = None
+        self.qk_layernorm = False
+        self.rms_norm_eps = None
 
-#         self.num_cores_per_group = 1
-#         self.flash_decoding_enabled = False
-#         self.sequence_parallel_enabled = False
-#         self.sequence_dimension = None
-#         self.rpl_reduce_dtype = None
+        self.num_cores_per_group = 1
+        self.flash_decoding_enabled = False
+        self.sequence_parallel_enabled = False
+        self.sequence_dimension = None
+        self.rpl_reduce_dtype = None
 
-#         self.o_proj_layer_name = "o_proj"
+        self.o_proj_layer_name = "o_proj"
 
-#     def init_gqa_properties(self):
-#         if (self.head_dim * self.num_attention_heads) != self.hidden_size:
-#             raise ValueError(
-#                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-#                 f" and `num_heads`: {self.num_attention_heads})."
-#             )
+    def init_gqa_properties(self):
+        if (self.head_dim * self.num_attention_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_attention_heads})."
+            )
 
-#         self.qkv_proj = GroupQueryAttention_QKV(
-#             hidden_size=self.hidden_size,
-#             head_dim=self.head_dim,
-#             num_attention_heads=self.num_attention_heads,
-#             num_key_value_heads=self.num_key_value_heads,
-#             tp_degree=self.tp_degree,
-#             dtype=self.torch_dtype,
-#             bias=self.bias,
-#             gather_output=False,
-#             fused_qkv=self.fused_qkv,
-#             clip_qkv=self.clip_qkv,
-#             sequence_parallel_enabled=self.sequence_parallel_enabled,
-#             sequence_dimension=self.sequence_dimension,
-#             tensor_model_parallel_group=self.tensor_model_parallel_group,
-#             rms_norm_eps=self.rms_norm_eps,
-#             qkv_kernel_enabled=self.neuron_config.qkv_kernel_enabled,
-#             logical_neuron_cores=self.neuron_config.logical_neuron_cores,
-#         )
-#         self.o_proj = GroupQueryAttention_O(
-#             hidden_size=self.hidden_size,
-#             head_dim=self.head_dim,
-#             num_attention_heads=self.num_attention_heads,
-#             num_key_value_heads=self.num_key_value_heads,
-#             tp_degree=self.tp_degree,
-#             dtype=self.torch_dtype,
-#             bias=self.bias,
-#             input_is_parallel=True,
-#             layer_name=self.o_proj_layer_name,
-#             sequence_parallel_enabled=self.sequence_parallel_enabled,
-#             sequence_dimension=self.sequence_dimension,
-#             tensor_model_parallel_group=self.tensor_model_parallel_group,
-#             rpl_reduce_dtype=self.rpl_reduce_dtype,
-#         )
-#         self.num_heads = utils.divide(self.qkv_proj.get_num_attention_heads(), self.tp_degree)
-#         self.num_key_value_heads = utils.divide(
-#             self.qkv_proj.get_num_key_value_heads(), self.tp_degree
-#         )
-#         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-#         if self.qk_layernorm:
-#             self.q_layernorm = nn.LayerNorm(self.head_dim)
-#             self.k_layernorm = nn.LayerNorm(self.head_dim)
-#         self.attn_kernel_enabled = self.neuron_config.attn_kernel_enabled
-#         self.logical_neuron_cores = self.neuron_config.logical_neuron_cores
+        self.qkv_proj = GroupQueryAttention_QKV(
+            hidden_size=self.hidden_size,
+            head_dim=self.head_dim,
+            num_attention_heads=self.num_attention_heads,
+            num_key_value_heads=self.num_key_value_heads,
+            tp_degree=self.tp_degree,
+            dtype=self.torch_dtype,
+            bias=self.bias,
+            gather_output=False,
+            fused_qkv=self.fused_qkv,
+            clip_qkv=self.clip_qkv,
+            sequence_parallel_enabled=self.sequence_parallel_enabled,
+            sequence_dimension=self.sequence_dimension,
+            tensor_model_parallel_group=self.tensor_model_parallel_group,
+            rms_norm_eps=self.rms_norm_eps,
+            qkv_kernel_enabled=self.neuron_config.qkv_kernel_enabled,
+            logical_neuron_cores=self.neuron_config.logical_neuron_cores,
+        )
+        self.o_proj = GroupQueryAttention_O(
+            hidden_size=self.hidden_size,
+            head_dim=self.head_dim,
+            num_attention_heads=self.num_attention_heads,
+            num_key_value_heads=self.num_key_value_heads,
+            tp_degree=self.tp_degree,
+            dtype=self.torch_dtype,
+            bias=self.bias,
+            input_is_parallel=True,
+            layer_name=self.o_proj_layer_name,
+            sequence_parallel_enabled=self.sequence_parallel_enabled,
+            sequence_dimension=self.sequence_dimension,
+            tensor_model_parallel_group=self.tensor_model_parallel_group,
+            rpl_reduce_dtype=self.rpl_reduce_dtype,
+        )
+        self.num_heads = utils.divide(self.qkv_proj.get_num_attention_heads(), self.tp_degree)
+        self.num_key_value_heads = utils.divide(
+            self.qkv_proj.get_num_key_value_heads(), self.tp_degree
+        )
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        if self.qk_layernorm:
+            self.q_layernorm = nn.LayerNorm(self.head_dim)
+            self.k_layernorm = nn.LayerNorm(self.head_dim)
+        self.attn_kernel_enabled = self.neuron_config.attn_kernel_enabled
+        self.logical_neuron_cores = self.neuron_config.logical_neuron_cores
 
-#     def scaled_qk(self, Q, K, attention_mask):
-#         ## 可以操作
-#         ## [32,64] [64,32]
-#         bs, head, sequence, dimension = Q.size()
-#         _, head_k, sequence_k, dimension_k = K.size()
-#         # print("size:", sequence)
-#         # print("size2:", sequence_k)
-#         result = torch.zeros((bs, head, sequence, sequence_k), device = Q.device, dtype=Q.dtype)
-#         # print("Q.type:", Q.dtype)
-#         for i in range(bs):
-#             for j in range(head):
-#                 temp_q = Q[i, j, :, :]
-#                 temp_k = (K.transpose(2, 3))[i, j, :, :]
-#                 # print("temp_q", temp_q.size())
-#                 # print("temp_k", temp_k.size())
-#                 temp = block_matmul(temp_q, temp_k)
-#                 result[i, j, :, :] = temp
-#         QK = result / math.sqrt(self.head_dim)
+    def scaled_qk(self, Q, K, attention_mask):
+        ## 可以操作
+        ## [32,64] [64,32]
+        bs, head, sequence, dimension = Q.size()
+        _, head_k, sequence_k, dimension_k = K.size()
+        # print("size:", sequence)
+        # print("size2:", sequence_k)
+        result = torch.zeros((bs, head, sequence, sequence_k), device = Q.device, dtype=Q.dtype)
+        # print("Q.type:", Q.dtype)
+        for i in range(bs):
+            for j in range(head):
+                temp_q = Q[i, j, :, :]
+                temp_k = (K.transpose(2, 3))[i, j, :, :]
+                # print("temp_q", temp_q.size())
+                # print("temp_k", temp_k.size())
+                temp = block_matmul(temp_q, temp_k)
+                result[i, j, :, :] = temp
+        QK = result / math.sqrt(self.head_dim)
 
-#         QK = torch.matmul(Q, K.transpose(2, 3)) / math.sqrt(self.head_dim)
-#         # print("Q", Q.size())
-#         # print("K", K.size())
-#         # print("QK:", QK.size())
-#         QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
-#         return QK
+        QK = torch.matmul(Q, K.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # print("Q", Q.size())
+        # print("K", K.size())
+        # print("QK:", QK.size())
+        QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
+        return QK
 
-#     def prep_qkv_tensors(
-#         self,
-#         position_ids,
-#         hidden_states,
-#         past_key_value,
-#         adapter_ids=None,
-#         cos_cache=None,
-#         sin_cache=None,
-#         rmsnorm=None,
-#     ):
-#         """take care of the shape, layout, group query, custom position encoding, etc."""
+    def prep_qkv_tensors(
+        self,
+        position_ids,
+        hidden_states,
+        past_key_value,
+        adapter_ids=None,
+        cos_cache=None,
+        sin_cache=None,
+        rmsnorm=None,
+    ):
+        """take care of the shape, layout, group query, custom position encoding, etc."""
 
-#         ## 可以操作
-#         ## [32, 2048][2048, 1024] // [32, 2048][2048, 256]
-#         Q = torch.matmul(hidden_states, self.qkv_proj.q_proj.weight.T)
-#         K = torch.matmul(hidden_states, self.qkv_proj.k_proj.weight.T)
-#         V = torch.matmul(hidden_states, self.qkv_proj.v_proj.weight.T)
-#         if self.qkv_proj.clip_qkv is not None:
-#             Q = Q.clamp(min=-self.clip_qkv, max=self.clip_qkv)
-#             K = K.clamp(min=-self.clip_qkv, max=self.clip_qkv)
-#             V = V.clamp(min=-self.clip_qkv, max=self.clip_qkv)
+        ## 可以操作
+        ## [32, 2048][2048, 1024] // [32, 2048][2048, 256]
+        Q = torch.matmul(hidden_states, self.qkv_proj.q_proj.weight.T)
+        K = torch.matmul(hidden_states, self.qkv_proj.k_proj.weight.T)
+        V = torch.matmul(hidden_states, self.qkv_proj.v_proj.weight.T)
+        if self.qkv_proj.clip_qkv is not None:
+            Q = Q.clamp(min=-self.clip_qkv, max=self.clip_qkv)
+            K = K.clamp(min=-self.clip_qkv, max=self.clip_qkv)
+            V = V.clamp(min=-self.clip_qkv, max=self.clip_qkv)
 
-#         # Q, K, V, cos_cache, sin_cache = self.prep_qkv_tensors(
-#         #     position_ids,
-#         #     hidden_states,
-#         #     past_key_value,
-#         #     adapter_ids=adapter_ids,
-#         #     cos_cache=cos_cache,
-#         #     sin_cache=sin_cache,
-#         #     rmsnorm=rmsnorm,
-#         # )
+        # Q, K, V, cos_cache, sin_cache = self.prep_qkv_tensors(
+        #     position_ids,
+        #     hidden_states,
+        #     past_key_value,
+        #     adapter_ids=adapter_ids,
+        #     cos_cache=cos_cache,
+        #     sin_cache=sin_cache,
+        #     rmsnorm=rmsnorm,
+        # )
 
-#         # Divide hidden_dim across heads for MHA
-#         # Change layout: BSHD -> BHSD
-#         bsz, q_len, _ = hidden_states.size()
-#         if self.sequence_parallel_enabled:
-#             q_len *= self.tensor_model_parallel_group.size()
+        # Divide hidden_dim across heads for MHA
+        # Change layout: BSHD -> BHSD
+        bsz, q_len, _ = hidden_states.size()
+        if self.sequence_parallel_enabled:
+            q_len *= self.tensor_model_parallel_group.size()
 
-#         Q = move_heads_front(
-#             Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=self.q_layernorm
-#         )
-#         K = move_heads_front(
-#             K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=self.k_layernorm
-#         )
-#         V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
+        Q = move_heads_front(
+            Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=self.q_layernorm
+        )
+        K = move_heads_front(
+            K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=self.k_layernorm
+        )
+        V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
 
-#         # Rotate Q and K
-#         if self.rotary_emb is not None:
-#             if cos_cache is None or sin_cache is None:
-#                 cos_cache, sin_cache = self.rotary_emb(V, position_ids)
+        # Rotate Q and K
+        if self.rotary_emb is not None:
+            if cos_cache is None or sin_cache is None:
+                cos_cache, sin_cache = self.rotary_emb(V, position_ids)
 
-#             Q, K = apply_rotary_pos_emb(Q, K, cos_cache, sin_cache)
+            Q, K = apply_rotary_pos_emb(Q, K, cos_cache, sin_cache)
 
-#         return Q, K, V, cos_cache, sin_cache
+        return Q, K, V, cos_cache, sin_cache
 
-#     def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask) -> Tensor:
-#         """attention computation at prefilling (context encoding) phase"""
-#         K_active = repeat_kv(K, self.num_key_value_groups)
-#         V_active = repeat_kv(V, self.num_key_value_groups)
+    def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask) -> Tensor:
+        """attention computation at prefilling (context encoding) phase"""
+        K_active = repeat_kv(K, self.num_key_value_groups)
+        V_active = repeat_kv(V, self.num_key_value_groups)
 
-#         flash_attn_strategy = self.get_flash_attention_strategy(q_len)
-#         logger.debug(f"Flash attention strategy: {flash_attn_strategy}")
+        flash_attn_strategy = self.get_flash_attention_strategy(q_len)
+        logger.debug(f"Flash attention strategy: {flash_attn_strategy}")
 
-#         if flash_attn_strategy != FlashAttentionStrategy.NONE:
-#             logger.debug(f"ATTN kernel: logical_neuron_cores={self.logical_neuron_cores}")
-#             # if we are using left padding, then the bzs needs be 1 (otherwise we get wrong result
-#             # because flash attention does not use attention_mask). In practice, we use right
-#             # padding so this is unlikely to cause issues
-#             assert self.padding_side == "right" or bsz == 1
+        if flash_attn_strategy != FlashAttentionStrategy.NONE:
+            logger.debug(f"ATTN kernel: logical_neuron_cores={self.logical_neuron_cores}")
+            # if we are using left padding, then the bzs needs be 1 (otherwise we get wrong result
+            # because flash attention does not use attention_mask). In practice, we use right
+            # padding so this is unlikely to cause issues
+            assert self.padding_side == "right" or bsz == 1
 
-#             # original shape of q, k, v is BHSD, and expected output is also BHSD.
-#             logger.debug(f"Using flash_fwd for Q.shape={Q.shape}")
-#             # make sure to cast inputs to torch_dtype (this is needed because the downcast to bf16
-#             # might happen after the kernel hlo creation step). Also convert shapes as expected by the kernel.
+            # original shape of q, k, v is BHSD, and expected output is also BHSD.
+            logger.debug(f"Using flash_fwd for Q.shape={Q.shape}")
+            # make sure to cast inputs to torch_dtype (this is needed because the downcast to bf16
+            # might happen after the kernel hlo creation step). Also convert shapes as expected by the kernel.
 
-#             # original Q shape: batch, num_heads, seqlen, d_head
-#             Q = (
-#                 Q.permute(0, 1, 3, 2)  # after permute: batch, num_heads, d_head, seqlen
-#                 .reshape((bsz * self.num_heads, self.head_dim, q_len))
-#                 .to(self.torch_dtype)
-#             )
-#             Q = Q / math.sqrt(self.head_dim)
-#             K_active = (
-#                 K_active.permute(0, 1, 3, 2)
-#                 .reshape((bsz * self.num_heads, self.head_dim, q_len))
-#                 .to(self.torch_dtype)
-#             )
-#             V_active = V_active.reshape((bsz * self.num_heads, q_len, self.head_dim)).to(
-#                 self.torch_dtype
-#             )
-#             # shape: (B*H)DS
-#             attn_output = torch.zeros(
-#                 bsz * self.num_heads, self.head_dim, q_len, dtype=Q.dtype, device=Q.device
-#             )
+            # original Q shape: batch, num_heads, seqlen, d_head
+            Q = (
+                Q.permute(0, 1, 3, 2)  # after permute: batch, num_heads, d_head, seqlen
+                .reshape((bsz * self.num_heads, self.head_dim, q_len))
+                .to(self.torch_dtype)
+            )
+            Q = Q / math.sqrt(self.head_dim)
+            K_active = (
+                K_active.permute(0, 1, 3, 2)
+                .reshape((bsz * self.num_heads, self.head_dim, q_len))
+                .to(self.torch_dtype)
+            )
+            V_active = V_active.reshape((bsz * self.num_heads, q_len, self.head_dim)).to(
+                self.torch_dtype
+            )
+            # shape: (B*H)DS
+            attn_output = torch.zeros(
+                bsz * self.num_heads, self.head_dim, q_len, dtype=Q.dtype, device=Q.device
+            )
 
-#             logger.debug("Input parameter shapes")
-#             logger.debug(f"Q input shape {Q.shape}")
-#             logger.debug(f"K input shape {K_active.shape}")
-#             logger.debug(f"V input shape {V_active.shape}")
-#             logger.debug(f"Attn output shape {attn_output.shape}")
+            logger.debug("Input parameter shapes")
+            logger.debug(f"Q input shape {Q.shape}")
+            logger.debug(f"K input shape {K_active.shape}")
+            logger.debug(f"V input shape {V_active.shape}")
+            logger.debug(f"Attn output shape {attn_output.shape}")
 
-#             if flash_attn_strategy == FlashAttentionStrategy.SHARDED_KERNEL:
-#                 grid = (vnc(self.logical_neuron_cores),)
+            if flash_attn_strategy == FlashAttentionStrategy.SHARDED_KERNEL:
+                grid = (vnc(self.logical_neuron_cores),)
 
-#                 _flash_fwd_call[grid](
-#                     Q,
-#                     K_active,
-#                     V_active,
-#                     1.0,
-#                     attn_output,
-#                     kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap",
-#                 )
-#             elif flash_attn_strategy == FlashAttentionStrategy.UNSHARDED_KERNEL:
-#                 _flash_fwd_call(
-#                     Q,
-#                     K_active,
-#                     V_active,
-#                     1.0,
-#                     attn_output,
-#                     kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap",
-#                 )
-#             else:
-#                 raise ValueError(f"Invalid flash attention strategy: {flash_attn_strategy}")
+                _flash_fwd_call[grid](
+                    Q,
+                    K_active,
+                    V_active,
+                    1.0,
+                    attn_output,
+                    kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap",
+                )
+            elif flash_attn_strategy == FlashAttentionStrategy.UNSHARDED_KERNEL:
+                _flash_fwd_call(
+                    Q,
+                    K_active,
+                    V_active,
+                    1.0,
+                    attn_output,
+                    kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap",
+                )
+            else:
+                raise ValueError(f"Invalid flash attention strategy: {flash_attn_strategy}")
 
-#             # shape: BHDS
-#             attn_output = attn_output.reshape((bsz, self.num_heads, self.head_dim, q_len))
-#             logger.debug(f"Attn output after reshape {attn_output.shape}")
-#         else:
-#             logger.debug("ATTN: native compiler")
-#             logger.debug(f"Not using flash_fwd for Q.shape={Q.shape}")
-#             active_scores = self.scaled_qk(Q, K_active, attention_mask)
-#             active_scores = nn.functional.softmax(active_scores, dim=-1, dtype=torch.float32).to(
-#                 Q.dtype
-#             )
+            # shape: BHDS
+            attn_output = attn_output.reshape((bsz, self.num_heads, self.head_dim, q_len))
+            logger.debug(f"Attn output after reshape {attn_output.shape}")
+        else:
+            logger.debug("ATTN: native compiler")
+            logger.debug(f"Not using flash_fwd for Q.shape={Q.shape}")
+            active_scores = self.scaled_qk(Q, K_active, attention_mask)
+            active_scores = nn.functional.softmax(active_scores, dim=-1, dtype=torch.float32).to(
+                Q.dtype
+            )
             
-#             # 可以操作
-#             # print("active_scores:", active_scores.size())
-#             # print("V_active:", V_active.size())
-#             ## [1,16,32,32] [1,16,32,64]
+            # 可以操作
+            # print("active_scores:", active_scores.size())
+            # print("V_active:", V_active.size())
+            ## [1,16,32,32] [1,16,32,64]
 
-#             ###(有格式问题)
-#             # active_scores = active_scores.to(Q.dtype)
-#             # V_active = V_active.to(Q.dtype)
-#             # bs, head, sequence, dimension = active_scores.size()
-#             # _, head_1, sequence_1, dimension_1 = V_active.size()
-#             # # print("active_scores.type:", active_scores.dtype)
-#             # # print("V_active.type:", V_active.dtype)
-#             # # print("size:", sequence)
-#             # # print("size2:", sequence_k)
-#             # result = torch.zeros((bs, head, sequence, dimension_1), device = active_scores.device, dtype=active_scores.dtype)
-#             # for i in range(bs):
-#             #     for j in range(head):
-#             #         temp_q = active_scores[i, j, :, :]
-#             #         temp_k = V_active[i, j, :, :]
-#             #         temp = block_matmul(temp_q, temp_k)
-#             #         result[i, j, :, :] = temp
-#             # attn_output = result
-#             ###
+            ###(有格式问题)
+            # active_scores = active_scores.to(Q.dtype)
+            # V_active = V_active.to(Q.dtype)
+            # bs, head, sequence, dimension = active_scores.size()
+            # _, head_1, sequence_1, dimension_1 = V_active.size()
+            # # print("active_scores.type:", active_scores.dtype)
+            # # print("V_active.type:", V_active.dtype)
+            # # print("size:", sequence)
+            # # print("size2:", sequence_k)
+            # result = torch.zeros((bs, head, sequence, dimension_1), device = active_scores.device, dtype=active_scores.dtype)
+            # for i in range(bs):
+            #     for j in range(head):
+            #         temp_q = active_scores[i, j, :, :]
+            #         temp_k = V_active[i, j, :, :]
+            #         temp = block_matmul(temp_q, temp_k)
+            #         result[i, j, :, :] = temp
+            # attn_output = result
+            ###
 
-#             attn_output = torch.matmul(active_scores, V_active)
-#         return attn_output, flash_attn_strategy
+            attn_output = torch.matmul(active_scores, V_active)
+        return attn_output, flash_attn_strategy
 
-#     def get_flash_attention_strategy(self, q_len) -> FlashAttentionStrategy:
-#         """
-#         Gets the flash attention strategy.
+    def get_flash_attention_strategy(self, q_len) -> FlashAttentionStrategy:
+        """
+        Gets the flash attention strategy.
 
-#         For LNC1, use the unsharded kernel if sequence length is at least 4096 to get the best performance.
-#         The unsharded kernel requires a sequence length of at least 512.
+        For LNC1, use the unsharded kernel if sequence length is at least 4096 to get the best performance.
+        The unsharded kernel requires a sequence length of at least 512.
 
-#         For LNC2, use the sharded kernel if sequence length is divisible by 1024. Otherwise, use no
-#         kernel, because the unsharded kernel has worse performance than no kernel.
-#         The sharded kernel requires a sequence length of at least 1024.
+        For LNC2, use the sharded kernel if sequence length is divisible by 1024. Otherwise, use no
+        kernel, because the unsharded kernel has worse performance than no kernel.
+        The sharded kernel requires a sequence length of at least 1024.
 
-#         These constraints may change later.
+        These constraints may change later.
 
-#         TODO: Throw an exception instead of disabling flash attention if explicitly enabled but not eligible.
-#               This must consider bucketing to avoid throwing an exception for smaller buckets.
-#         """
-#         if int(self.logical_neuron_cores) > 1:
-#             if q_len < 1024:
-#                 return FlashAttentionStrategy.NONE
+        TODO: Throw an exception instead of disabling flash attention if explicitly enabled but not eligible.
+              This must consider bucketing to avoid throwing an exception for smaller buckets.
+        """
+        if int(self.logical_neuron_cores) > 1:
+            if q_len < 1024:
+                return FlashAttentionStrategy.NONE
 
-#             if q_len % 1024 == 0:
-#                 return FlashAttentionStrategy.SHARDED_KERNEL
-#             else:
-#                 warnings.warn(
-#                     "Flash attention disabled. LNC2 requires seq_len % 1024 for flash attn to be performant"
-#                 )
-#                 return FlashAttentionStrategy.NONE
+            if q_len % 1024 == 0:
+                return FlashAttentionStrategy.SHARDED_KERNEL
+            else:
+                warnings.warn(
+                    "Flash attention disabled. LNC2 requires seq_len % 1024 for flash attn to be performant"
+                )
+                return FlashAttentionStrategy.NONE
 
-#         # If seq_len is at least 4096, enable flash attn automatically to improve performance.
-#         if q_len >= 4096:
-#             return FlashAttentionStrategy.UNSHARDED_KERNEL
+        # If seq_len is at least 4096, enable flash attn automatically to improve performance.
+        if q_len >= 4096:
+            return FlashAttentionStrategy.UNSHARDED_KERNEL
 
-#         # At lower seq lens, enable only if explicitly enabled.
-#         if self.attn_kernel_enabled and q_len >= 512:
-#             return FlashAttentionStrategy.UNSHARDED_KERNEL
+        # At lower seq lens, enable only if explicitly enabled.
+        if self.attn_kernel_enabled and q_len >= 512:
+            return FlashAttentionStrategy.UNSHARDED_KERNEL
 
-#         return FlashAttentionStrategy.NONE
+        return FlashAttentionStrategy.NONE
 
-#     def compute_for_flash_decoding(
-#         self, Q, K, V, past_key_value, attention_mask, active_mask
-#     ) -> Tensor:
-#         # TODO: refactor/decompose this to reduce duplication with compute_for_token_gen
-#         # active attention
-#         n_repeat = Q.shape[1]
-#         K_active = repeat_kv(K, n_repeat)
-#         V_active = repeat_kv(V, n_repeat)
+    def compute_for_flash_decoding(
+        self, Q, K, V, past_key_value, attention_mask, active_mask
+    ) -> Tensor:
+        # TODO: refactor/decompose this to reduce duplication with compute_for_token_gen
+        # active attention
+        n_repeat = Q.shape[1]
+        K_active = repeat_kv(K, n_repeat)
+        V_active = repeat_kv(V, n_repeat)
 
-#         # 可以操作(bujingguo)
-#         ## [32,64] [64,32]
-#         active_scores = (torch.matmul(Q, K_active.transpose(2, 3)) / math.sqrt(self.head_dim)).to(
-#             torch.float32
-#         )
-#         active_scores = torch.where(
-#             active_mask, active_scores, torch.finfo(active_scores.dtype).min
-#         )
+        # 可以操作(bujingguo)
+        ## [32,64] [64,32]
+        active_scores = (torch.matmul(Q, K_active.transpose(2, 3)) / math.sqrt(self.head_dim)).to(
+            torch.float32
+        )
+        active_scores = torch.where(
+            active_mask, active_scores, torch.finfo(active_scores.dtype).min
+        )
 
-#         # prior attention
-#         K_prior = repeat_kv(past_key_value[0], n_repeat)
-#         V_prior = repeat_kv(past_key_value[1], n_repeat)
+        # prior attention
+        K_prior = repeat_kv(past_key_value[0], n_repeat)
+        V_prior = repeat_kv(past_key_value[1], n_repeat)
 
-#         # 可以操作(bujinguo)
+        # 可以操作(bujinguo)
 
-#         prior_scores = torch.matmul(Q, K_prior.transpose(2, 3)) / math.sqrt(self.head_dim)
-#         prior_scores = torch.where(
-#             attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min
-#         )
-#         prior_scores = prior_scores.to(torch.float32)
+        prior_scores = torch.matmul(Q, K_prior.transpose(2, 3)) / math.sqrt(self.head_dim)
+        prior_scores = torch.where(
+            attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min
+        )
+        prior_scores = prior_scores.to(torch.float32)
 
-#         # attention scores
-#         softmax_prior, softmax_active = distributed_softmax(prior_scores, active_scores)
-#         softmax_prior, softmax_active = softmax_prior.to(Q.dtype), softmax_active.to(Q.dtype)
+        # attention scores
+        softmax_prior, softmax_active = distributed_softmax(prior_scores, active_scores)
+        softmax_prior, softmax_active = softmax_prior.to(Q.dtype), softmax_active.to(Q.dtype)
 
-#         ## 可以操作(bujingguo)
+        ## 可以操作(bujingguo)
 
-#         # print("softmax_prior", softmax_prior.size())
-#         # print("V_prior:", V_prior.size())
-#         # print("soft_active:", softmax_active.size())
-#         # print("V_active:", V_active.size())
-#         attn_prior = torch.matmul(softmax_prior, V_prior)
-#         attn_active = torch.matmul(softmax_active, V_active)
-#         attn_output = attn_prior + attn_active
+        # print("softmax_prior", softmax_prior.size())
+        # print("V_prior:", V_prior.size())
+        # print("soft_active:", softmax_active.size())
+        # print("V_active:", V_active.size())
+        attn_prior = torch.matmul(softmax_prior, V_prior)
+        attn_active = torch.matmul(softmax_active, V_active)
+        attn_output = attn_prior + attn_active
 
-#         return attn_output
+        return attn_output
 
-#     def compute_for_token_gen(
-#         self, Q, K, V, position_ids, past_key_value, attention_mask, active_mask
-#     ) -> Tensor:
-#         """attention computation at token generation phase"""
-#         is_speculation = position_ids.shape[-1] > 1
+    def compute_for_token_gen(
+        self, Q, K, V, position_ids, past_key_value, attention_mask, active_mask
+    ) -> Tensor:
+        """attention computation at token generation phase"""
+        is_speculation = position_ids.shape[-1] > 1
 
-#         # Attention computation: softmax((Q.K/√dkv) + mask).V
-#         # i. prior (cached) KV
-#         K_prior = past_key_value[0]
-#         V_prior = past_key_value[1]
-#         K_prior = repeat_kv(K_prior, self.num_key_value_groups)
-#         V_prior = repeat_kv(V_prior, self.num_key_value_groups)
+        # Attention computation: softmax((Q.K/√dkv) + mask).V
+        # i. prior (cached) KV
+        K_prior = past_key_value[0]
+        V_prior = past_key_value[1]
+        K_prior = repeat_kv(K_prior, self.num_key_value_groups)
+        V_prior = repeat_kv(V_prior, self.num_key_value_groups)
 
-#         ## 可以操作
+        ## 可以操作
         
-#         prior_scores = torch.matmul(Q, K_prior.transpose(2, 3)) / math.sqrt(self.head_dim)
-#         prior_scores = torch.where(
-#             attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min
-#         )
-#         prior_scores = prior_scores.to(torch.float32)
+        prior_scores = torch.matmul(Q, K_prior.transpose(2, 3)) / math.sqrt(self.head_dim)
+        prior_scores = torch.where(
+            attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min
+        )
+        prior_scores = prior_scores.to(torch.float32)
 
-#         # ii. active (current/new) KV
-#         K_active = repeat_kv(K, self.num_key_value_groups)
-#         V_active = repeat_kv(V, self.num_key_value_groups)
+        # ii. active (current/new) KV
+        K_active = repeat_kv(K, self.num_key_value_groups)
+        V_active = repeat_kv(V, self.num_key_value_groups)
 
-#         ## 可以操作
+        ## 可以操作
 
-#         active_scores = torch.matmul(Q, K_active.transpose(2, 3)) / math.sqrt(self.head_dim)
-#         if is_speculation:
-#             active_scores = torch.where(
-#                 active_mask, active_scores, torch.finfo(active_scores.dtype).min
-#             )
-#         active_scores = active_scores.to(torch.float32)
+        active_scores = torch.matmul(Q, K_active.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if is_speculation:
+            active_scores = torch.where(
+                active_mask, active_scores, torch.finfo(active_scores.dtype).min
+            )
+        active_scores = active_scores.to(torch.float32)
 
-#         # iii. attention scores
-#         softmax_prior, softmax_active = manual_softmax(prior_scores, active_scores, is_speculation)
-#         softmax_prior, softmax_active = softmax_prior.to(Q.dtype), softmax_active.to(Q.dtype)
+        # iii. attention scores
+        softmax_prior, softmax_active = manual_softmax(prior_scores, active_scores, is_speculation)
+        softmax_prior, softmax_active = softmax_prior.to(Q.dtype), softmax_active.to(Q.dtype)
 
-#         ## 可以操作
-#         #[1,16,1,64][1,16,64,64]
-#         #[1,16,1,1][1,16,1,64]
-#         # print("softmax_prior", softmax_prior.size())
-#         # print("V_prior:", V_prior.size())
-#         # print("soft_active:", softmax_active.size())
-#         # print("V_active:", V_active.size())
+        ## 可以操作
+        #[1,16,1,64][1,16,64,64]
+        #[1,16,1,1][1,16,1,64]
+        # print("softmax_prior", softmax_prior.size())
+        # print("V_prior:", V_prior.size())
+        # print("soft_active:", softmax_active.size())
+        # print("V_active:", V_active.size())
 
-#         ###
-#         # softmax_prior = softmax_prior.to(Q.dtype)
-#         # V_prior = V_prior.to(Q.dtype)
-#         # bs, head, sequence, dimension = softmax_prior.size()
-#         # _, head_1, sequence_1, dimension_1 = V_prior.size()
-#         # result = torch.zeros((bs, head, sequence, dimension_1), device = softmax_prior.device, dtype=softmax_prior.dtype)
-#         # for i in range(bs):
-#         #     for j in range(head):
-#         #         temp_q = softmax_prior[i, j, :, :]
-#         #         temp_k = V_prior[i, j, :, :]
-#         #         temp = block_matmul(temp_q, temp_k)
-#         #         result[i, j, :, :] = temp
-#         # attn_prior = result
-#         ###
+        ###
+        # softmax_prior = softmax_prior.to(Q.dtype)
+        # V_prior = V_prior.to(Q.dtype)
+        # bs, head, sequence, dimension = softmax_prior.size()
+        # _, head_1, sequence_1, dimension_1 = V_prior.size()
+        # result = torch.zeros((bs, head, sequence, dimension_1), device = softmax_prior.device, dtype=softmax_prior.dtype)
+        # for i in range(bs):
+        #     for j in range(head):
+        #         temp_q = softmax_prior[i, j, :, :]
+        #         temp_k = V_prior[i, j, :, :]
+        #         temp = block_matmul(temp_q, temp_k)
+        #         result[i, j, :, :] = temp
+        # attn_prior = result
+        ###
 
-#         ###
-#         # softmax_active = softmax_active.to(Q.dtype)
-#         # V_active = V_active.to(Q.dtype)
-#         # bs, head, sequence, dimension = softmax_active.size()
-#         # _, head_1, sequence_1, dimension_1 = V_active.size()
-#         # result = torch.zeros((bs, head, sequence, dimension_1), device = softmax_active.device, dtype=softmax_active.dtype)
-#         # for i in range(bs):
-#         #     for j in range(head):
-#         #         temp_q = softmax_active[i, j, :, :]
-#         #         temp_k = V_active[i, j, :, :]
-#         #         temp = block_matmul(temp_q, temp_k)
-#         #         result[i, j, :, :] = temp
-#         # attn_active = result
-#         ###
+        ###
+        # softmax_active = softmax_active.to(Q.dtype)
+        # V_active = V_active.to(Q.dtype)
+        # bs, head, sequence, dimension = softmax_active.size()
+        # _, head_1, sequence_1, dimension_1 = V_active.size()
+        # result = torch.zeros((bs, head, sequence, dimension_1), device = softmax_active.device, dtype=softmax_active.dtype)
+        # for i in range(bs):
+        #     for j in range(head):
+        #         temp_q = softmax_active[i, j, :, :]
+        #         temp_k = V_active[i, j, :, :]
+        #         temp = block_matmul(temp_q, temp_k)
+        #         result[i, j, :, :] = temp
+        # attn_active = result
+        ###
 
-#         attn_prior = torch.matmul(softmax_prior, V_prior)
-#         attn_active = torch.matmul(softmax_active, V_active)
-#         attn_output = attn_prior + attn_active
+        attn_prior = torch.matmul(softmax_prior, V_prior)
+        attn_active = torch.matmul(softmax_active, V_active)
+        attn_output = attn_prior + attn_active
 
-#         return attn_output
+        return attn_output
 
-#     def forward(
-#         self,
-#         hidden_states: torch.Tensor,
-#         attention_mask: Optional[torch.Tensor] = None,
-#         position_ids: Optional[torch.LongTensor] = None,
-#         past_key_value: Optional[Tuple[torch.Tensor]] = None,
-#         active_mask: Optional[torch.LongTensor] = None,
-#         adapter_ids=None,
-#         cos_cache: Optional[torch.Tensor] = None,
-#         sin_cache: Optional[torch.Tensor] = None,
-#         rmsnorm=None,
-#     ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
-#         """Implements each layer's forward pass for the attention block."""
-#         bsz, q_len, _ = hidden_states.size()
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        active_mask: Optional[torch.LongTensor] = None,
+        adapter_ids=None,
+        cos_cache: Optional[torch.Tensor] = None,
+        sin_cache: Optional[torch.Tensor] = None,
+        rmsnorm=None,
+    ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
+        """Implements each layer's forward pass for the attention block."""
+        bsz, q_len, _ = hidden_states.size()
 
-#         Q, K, V, cos_cache, sin_cache = self.prep_qkv_tensors(
-#             position_ids,
-#             hidden_states,
-#             past_key_value,
-#             adapter_ids=adapter_ids,
-#             cos_cache=cos_cache,
-#             sin_cache=sin_cache,
-#             rmsnorm=rmsnorm,
-#         )
+        Q, K, V, cos_cache, sin_cache = self.prep_qkv_tensors(
+            position_ids,
+            hidden_states,
+            past_key_value,
+            adapter_ids=adapter_ids,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            rmsnorm=rmsnorm,
+        )
 
-#         if past_key_value is None:
-#             attn_output, _ = self.perform_prefill(
-#                 Q, K, V, q_len, bsz, attention_mask
-#             )
-#         else:
-#             attn_output = self.compute_for_token_gen(
-#                 Q, K, V, position_ids, past_key_value, attention_mask, active_mask
-#             )
-
-
-#         attn_output = attn_output.transpose(1, 2).contiguous()
-
-#         # merge multi head hidden
-#         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
-
-#         # Z = Z.Wo
-#         attn_output = self.o_proj(attn_output, adapter_ids=adapter_ids)
-
-#         past_key_value: Tuple[Tensor, Tensor] = (K, V)
-
-#         return attn_output, past_key_value, cos_cache, sin_cache
-
-### attention base class
+        if past_key_value is None:
+            attn_output, _ = self.perform_prefill(
+                Q, K, V, q_len, bsz, attention_mask
+            )
+        else:
+            attn_output = self.compute_for_token_gen(
+                Q, K, V, position_ids, past_key_value, attention_mask, active_mask
+            )
 
 
+        attn_output = attn_output.transpose(1, 2).contiguous()
+
+        # merge multi head hidden
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+
+        # Z = Z.Wo
+        attn_output = self.o_proj(attn_output, adapter_ids=adapter_ids)
+
+        past_key_value: Tuple[Tensor, Tensor] = (K, V)
+
+        return attn_output, past_key_value, cos_cache, sin_cache
+
+## attention base class
+
+@nki.jit
+def nki_matmul_fully_optimized_spmd_(
+    lhsT,
+    rhs,
+    TILES_IN_BLOCK_M=1,
+    TILES_IN_BLOCK_N=16,
+    TILES_IN_BLOCK_K=8,
+    # Number of parallel “chunks” (SPMD workers) we want along the M dimension:
+    spmd_m=2
+):
+    """
+    SPMD variant of your matmul kernel, distributing the M blocks among `spmd_m` workers.
+    Each worker runs the same code, but only processes a slice of the M dimension.
+    """
+
+    # 1) Validate shapes
+    K, M = lhsT.shape
+    K_, N = rhs.shape
+    assert K == K_, "lhsT and rhs must have the same contraction dimension"
+
+    # 2) Allocate the final result in shared HBM
+    result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+
+    # 3) Define tile sizes (as before)
+    TILE_M = nl.tile_size.gemm_stationary_fmax  # usually 128
+    TILE_K = nl.tile_size.pmax                  # usually 128
+    TILE_N = nl.tile_size.gemm_moving_fmax      # usually 512
+
+    # 4) Compute the block sizes
+    BLOCK_M = TILE_M * TILES_IN_BLOCK_M
+    BLOCK_N = TILE_N * TILES_IN_BLOCK_N
+    BLOCK_K = TILE_K * TILES_IN_BLOCK_K
+
+    # 5) Ensure the global shapes are multiples of these blocks
+    assert M % BLOCK_M == 0, "M not divisible by BLOCK_M"
+    assert N % BLOCK_N == 0, "N not divisible by BLOCK_N"
+    assert K % BLOCK_K == 0, "K not divisible by BLOCK_K"
+
+    # 6) Count how many blocks along each dimension
+    NUM_BLOCK_M = M // BLOCK_M  # total blocks in M dimension
+    NUM_BLOCK_N = N // BLOCK_N  # total blocks in N dimension
+    NUM_BLOCK_K = K // BLOCK_K  # total blocks in K dimension
+
+    # ------------------------------------------------------------------
+    # 7) Figure out which sub-range of M-blocks *this SPMD worker* handles
+    #    We assume we want to distribute M across spmd_m cores.
+    #    So we chunk the M-block range [0..NUM_BLOCK_M) into spmd_m pieces.
+    # ------------------------------------------------------------------
+    # This kernel’s "worker id" along dimension 0:
+    my_m_id = nl.program_id(0)  # 0,1,... up to (spmd_m-1)
+
+    # Blocks per worker in M dimension:
+    blocks_per_worker = NUM_BLOCK_M // spmd_m
+    assert (NUM_BLOCK_M % spmd_m) == 0, \
+        "For simplicity, we assume NUM_BLOCK_M is divisible by spmd_m"
+
+    start_m = my_m_id * blocks_per_worker
+    end_m   = (my_m_id + 1) * blocks_per_worker
+
+    # 8) Outer loop on N dimension
+    for n in nl.affine_range(NUM_BLOCK_N):
+
+        # We’ll store partial results in SBUF as you already do
+        result_tiles = nl.zeros(
+            (blocks_per_worker, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N,
+             nl.par_dim(TILE_M), TILE_N),
+            dtype=lhsT.dtype,
+            buffer=nl.sbuf
+        )
+
+        # 9) Loop over K dimension
+        for k_blk in nl.sequential_range(NUM_BLOCK_K):
+            # -- Load tiles from RHS
+            i_rhs = nl.mgrid[0:TILE_K, 0:BLOCK_N]
+            rhs_tiles = nl.ndarray(
+                (TILES_IN_BLOCK_K, nl.par_dim(TILE_K), BLOCK_N),
+                dtype=rhs.dtype,
+                buffer=nl.sbuf
+            )
+
+            for bk_r in nl.affine_range(TILES_IN_BLOCK_K):
+                rhs_tiles[bk_r, i_rhs.p, i_rhs.x] = nl.load(
+                    rhs[(TILES_IN_BLOCK_K * k_blk + bk_r) * TILE_K + i_rhs.p,
+                        BLOCK_N * n + i_rhs.x]
+                )
+
+            # 10) Now loop over *our subset* of M blocks
+            for local_m_index in nl.affine_range(blocks_per_worker):
+                # The global M block index this worker is handling
+                m = start_m + local_m_index
+
+                # -- Load tiles from LHS^T
+                i_lhsT = nl.mgrid[0:TILE_K, 0:BLOCK_M]
+                lhsT_tiles = nl.ndarray(
+                    (TILES_IN_BLOCK_K, nl.par_dim(TILE_K), BLOCK_M),
+                    dtype=lhsT.dtype,
+                    buffer=nl.sbuf
+                )
+                for bk_l in nl.affine_range(TILES_IN_BLOCK_K):
+                    lhsT_tiles[bk_l, i_lhsT.p, i_lhsT.x] = nl.load(
+                        lhsT[(TILES_IN_BLOCK_K * k_blk + bk_l) * TILE_K + i_lhsT.p,
+                             BLOCK_M * m + i_lhsT.x]
+                    )
+
+                # -- Perform the partial matmul
+                i_lhsT_mm = nl.mgrid[0:TILE_K, 0:TILE_M]
+                i_rhs_mm  = nl.mgrid[0:TILE_K, 0:TILE_N]
+                i_res_mm  = nl.mgrid[0:TILE_M, 0:TILE_N]
+                for bn in nl.affine_range(TILES_IN_BLOCK_N):
+                    for bm in nl.affine_range(TILES_IN_BLOCK_M):
+                        res_tile = nl.zeros((TILE_M, TILE_N),
+                                            dtype=nl.float32, buffer=nl.psum)
+                        for bk in nl.affine_range(TILES_IN_BLOCK_K):
+                            res_tile[...] += nisa.nc_matmul(
+                                lhsT_tiles[bk, i_lhsT_mm.p, bm*TILE_M + i_lhsT_mm.x],
+                                rhs_tiles[bk, i_rhs_mm.p, bn*TILE_N + i_rhs_mm.x]
+                            )
+                        # Accumulate partial sums into SBUF tile
+                        result_tiles[local_m_index, bm, bn,
+                                     i_res_mm.p, i_res_mm.x] += \
+                            res_tile[i_res_mm.p, i_res_mm.x]
+
+        # 11) Write final tiles from SBUF → shared HBM
+        for local_m_index in nl.affine_range(blocks_per_worker):
+            # The global M block index
+            m = start_m + local_m_index
+            for bm in nl.affine_range(TILES_IN_BLOCK_M):
+                i_res        = nl.mgrid[0:TILE_K, 0:TILE_N]
+                i_res_packed = nl.mgrid[0:TILE_K, 0:BLOCK_N]
+                result_packed = nl.ndarray((TILE_K, BLOCK_N),
+                                           dtype=result_tiles.dtype,
+                                           buffer=nl.sbuf)
+
+                # coalesce result tiles for better DMA performance
+                for bn in nl.affine_range(TILES_IN_BLOCK_N):
+                    result_packed[i_res.p, bn*TILE_N + i_res.x] = nl.copy(
+                        result_tiles[local_m_index, bm, bn, i_res.p, i_res.x]
+                    )
+                # Now store from SBUF to final result in HBM
+                nl.store(
+                    result[(TILES_IN_BLOCK_M*m + bm)*TILE_K + i_res_packed.p,
+                           BLOCK_N*n + i_res_packed.x],
+                    value=result_packed[i_res_packed.p, i_res_packed.x]
+                )
+
+    return result
+
+@nki.jit
+def nki_matmul_fully_optimized_spmd_proj_fused(
+    lhsT,         # shape (K, M)
+    rhs,          # shape (K, N)
+    TILES_IN_BLOCK_M=1,
+    TILES_IN_BLOCK_N=16,
+    TILES_IN_BLOCK_K=16,
+    spmd_m=2      # 2 SPMD workers along M dimension
+):
+    """
+    Example SPMD matmul kernel: (K,M) x (K,N) => (M,N).
+    Distributes M dimension across 2 cores.
+    """
+
+    # 1) shapes
+    K, M = lhsT.shape
+    K2, N = rhs.shape
+    assert K == K2, "lhsT and rhs must have the same contraction dimension"
+
+    # 2) tile sizes
+    TILE_M = nl.tile_size.gemm_stationary_fmax  # typically 128
+    TILE_K = nl.tile_size.pmax                  # typically 128
+    TILE_N = nl.tile_size.gemm_moving_fmax      # typically 512
+
+    BLOCK_M = TILE_M * TILES_IN_BLOCK_M
+    BLOCK_N = TILE_N * TILES_IN_BLOCK_N
+    BLOCK_K = TILE_K * TILES_IN_BLOCK_K
+
+    assert M % BLOCK_M == 0
+    assert N % BLOCK_N == 0
+    assert K % BLOCK_K == 0
+
+    NUM_BLOCK_M = M // BLOCK_M
+    NUM_BLOCK_N = N // BLOCK_N
+    NUM_BLOCK_K = K // BLOCK_K
+
+    # 3) figure out which slice of M blocks this spmd worker handles
+    my_m_id = nl.program_id(0)             # 0 or 1 if spmd_m=2
+    blocks_per_worker = NUM_BLOCK_M // spmd_m
+    start_m = my_m_id * blocks_per_worker
+    end_m   = (my_m_id + 1) * blocks_per_worker
+
+    # 4) Allocate final result shape (M,N) in shared HBM
+    result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+
+    # 5) Loop over the N dimension
+    for bn_idx in nl.affine_range(NUM_BLOCK_N):
+        # partial sums in SBUF for *our* M‑block slice
+        partial_sbuf = nl.zeros(
+            (blocks_per_worker, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N,
+             nl.par_dim(TILE_M), TILE_N),
+            dtype=lhsT.dtype,
+            buffer=nl.sbuf
+        )
+
+        # 6) Loop over K blocks (sequential)
+        for bk_idx in nl.sequential_range(NUM_BLOCK_K):
+            # -- load tiles from RHS
+            i_rhs = nl.mgrid[0:TILE_K, 0:BLOCK_N]
+            rhs_tiles = nl.ndarray(
+                (TILES_IN_BLOCK_K, nl.par_dim(TILE_K), BLOCK_N),
+                dtype=rhs.dtype,
+                buffer=nl.sbuf
+            )
+            for rsub in nl.affine_range(TILES_IN_BLOCK_K):
+                rhs_tiles[rsub, i_rhs.p, i_rhs.x] = nl.load(
+                    rhs[(TILES_IN_BLOCK_K * bk_idx + rsub)*TILE_K + i_rhs.p,
+                        BLOCK_N * bn_idx + i_rhs.x]
+                )
+
+            # 7) Now loop over *our slice* of M blocks
+            for local_m in nl.affine_range(blocks_per_worker):
+                real_m = start_m + local_m
+
+                # -- load tiles from LHS^T
+                i_lhsT = nl.mgrid[0:TILE_K, 0:BLOCK_M]
+                lhsT_tiles = nl.ndarray(
+                    (TILES_IN_BLOCK_K, nl.par_dim(TILE_K), BLOCK_M),
+                    dtype=lhsT.dtype,
+                    buffer=nl.sbuf
+                )
+                for lsub in nl.affine_range(TILES_IN_BLOCK_K):
+                    lhsT_tiles[lsub, i_lhsT.p, i_lhsT.x] = nl.load(
+                        lhsT[(TILES_IN_BLOCK_K * bk_idx + lsub)*TILE_K + i_lhsT.p,
+                             BLOCK_M * real_m + i_lhsT.x]
+                    )
+
+                # 8) Do the partial matmul accumulations
+                i_lhsT_mm = nl.mgrid[0:TILE_K, 0:TILE_M]
+                i_rhs_mm  = nl.mgrid[0:TILE_K, 0:TILE_N]
+                i_res_mm  = nl.mgrid[0:TILE_M, 0:TILE_N]
+
+                for bn_sub in nl.affine_range(TILES_IN_BLOCK_N):
+                    for bm_sub in nl.affine_range(TILES_IN_BLOCK_M):
+                        res_tile = nl.zeros((TILE_M, TILE_N),
+                                            dtype=nl.float32,
+                                            buffer=nl.psum)
+                        for bk_sub in nl.affine_range(TILES_IN_BLOCK_K):
+                            res_tile[...] += nisa.nc_matmul(
+                                lhsT_tiles[bk_sub, i_lhsT_mm.p,
+                                           bm_sub*TILE_M + i_lhsT_mm.x],
+                                rhs_tiles[bk_sub, i_rhs_mm.p,
+                                          bn_sub*TILE_N + i_rhs_mm.x]
+                            )
+                        partial_sbuf[local_m, bm_sub, bn_sub,
+                                     i_res_mm.p, i_res_mm.x] += \
+                            res_tile[i_res_mm.p, i_res_mm.x]
+
+        # 9) Store final data from SBUF => result
+        for local_m in nl.affine_range(blocks_per_worker):
+            real_m = start_m + local_m
+            for bm_sub in nl.affine_range(TILES_IN_BLOCK_M):
+                i_res        = nl.mgrid[0:TILE_K, 0:TILE_N]
+                i_res_packed = nl.mgrid[0:TILE_K, 0:BLOCK_N]
+                result_packed = nl.ndarray((TILE_K, BLOCK_N),
+                                           dtype=lhsT.dtype,
+                                           buffer=nl.sbuf)
+                # coalesce
+                for bn_sub in nl.affine_range(TILES_IN_BLOCK_N):
+                    result_packed[i_res.p,
+                                  bn_sub*TILE_N + i_res.x] = nl.copy(
+                        partial_sbuf[local_m, bm_sub, bn_sub,
+                                     i_res.p, i_res.x]
+                    )
+                # store in final (M,N)
+                nl.store(
+                    result[(TILES_IN_BLOCK_M*real_m + bm_sub)*TILE_K + i_res_packed.p,
+                           BLOCK_N*bn_idx + i_res_packed.x],
+                    value=result_packed[i_res_packed.p, i_res_packed.x]
+                )
+
+    return result
 
 @nki.jit
 def matmul_test(lhs_small, rhs_small, size1, size2):
@@ -648,126 +926,6 @@ def matmul_test(lhs_small, rhs_small, size1, size2):
     res_psum = nl.matmul(nki_lhs_small, nki_rhs_small, transpose_x=True)
     result = nl.ndarray((size1, size2), dtype=lhs_small.dtype, buffer=nl.shared_hbm)
     nl.store(result[:, :], value=res_psum)
-    return result
-
-@nki.jit
-def nki_mat_mul_test(lhs, rhs):
-
-    M, K = lhs.shape         # [M, K]
-    K2, N = rhs.shape        # [K, N]
-    assert K == K2
-
-    TILE_M = 128
-    TILE_K = 128
-    TILE_N = 512
-    TILES_IN_BLOCK_M = 16
-    TILES_IN_BLOCK_N = 2
-    TILES_IN_BLOCK_K = 8
-
-    BLOCK_M = TILE_M * TILES_IN_BLOCK_M  # 128*16=2048
-    BLOCK_N = TILE_N * TILES_IN_BLOCK_N  # 512*2=1024
-    BLOCK_K = TILE_K * TILES_IN_BLOCK_K  # 128*8=1024
-
-    result = nl.zeros((M, N), dtype=lhs.dtype, buffer=nl.shared_hbm)
-
-    aligned = (M % BLOCK_M == 0) and (N % BLOCK_N == 0) and (K % BLOCK_K == 0)
-    if aligned:
-        temp_aligned = nki_matmul_fully_optimized_(lhs.T, rhs)
-
-        i_xy = nl.mgrid[0:M, 0:N]
-        nl.store(
-            result[i_xy.p, i_xy.x],
-            temp_aligned[i_xy.p, i_xy.x]
-        )
-        return result
-
-    M_main = (M // BLOCK_M) * BLOCK_M
-    N_main = (N // BLOCK_N) * BLOCK_N
-    K_main = (K // BLOCK_K) * BLOCK_K
-
-    if (M_main > 0) and (N_main > 0) and (K_main > 0):
-        lhs_mainT = nl.ndarray((K_main, M_main), dtype=lhs.dtype, buffer=nl.sbuf)
-        i_lhs = nl.mgrid[0:K_main, 0:M_main]
-        nl.load(
-            lhs[i_lhs.x, i_lhs.p], 
-            out=lhs_mainT[i_lhs.p, i_lhs.x]
-        )
-
-        rhs_main = nl.ndarray((K_main, N_main), dtype=rhs.dtype, buffer=nl.sbuf)
-        i_rhs = nl.mgrid[0:K_main, 0:N_main]
-        nl.load(
-            rhs[i_rhs.p, i_rhs.x],
-            out=rhs_main[i_rhs.p, i_rhs.x]
-        )
-
-        out_main = nki_matmul_fully_optimized_(lhs_mainT, rhs_main)
-
-        i_main = nl.mgrid[0:M_main, 0:N_main]
-        nl.store(
-            result[i_main.p, i_main.x],
-            out_main[i_main.p, i_main.x]
-        )
-
-    K_tail = K - K_main
-    if (M_main > 0) and (N_main > 0) and (K_tail > 0):
-        res_sub = nl.copy(
-            result[0:M_main, 0:N_main], 
-            dtype=nl.float32,           
-            buffer=nl.psum
-        )
-
-        i_sub = nl.mgrid[0:M_main, 0:N_main]
-        for kk in nl.sequential_range(K_tail):
-            lhs_col = nl.load(lhs[i_sub.p, K_main + kk])     
-            rhs_row = nl.load(rhs[K_main + kk, i_sub.x])        
-            res_sub[i_sub.p, i_sub.x] += lhs_col[i_sub.p] * rhs_row[i_sub.x]
-
-        nl.store(
-            result[i_sub.p, i_sub.x],
-            res_sub[i_sub.p, i_sub.x]
-        )
-
-    N_tail = N - N_main
-    if (M_main > 0) and (N_tail > 0):
-        i_tr = nl.mgrid[0:M_main, 0:N_tail] 
-        res_tr = nl.zeros((M_main, N_tail), dtype=nl.float32, buffer=nl.psum)
-        for kk in nl.sequential_range(K): 
-            lhs_col = nl.load(lhs[i_tr.p, kk])     
-            rhs_col = nl.load(rhs[kk, N_main + i_tr.x]) 
-            res_tr[i_tr.p, i_tr.x] += lhs_col[i_tr.p] * rhs_col[i_tr.x]
-
-        nl.store(
-            result[i_tr.p, N_main + i_tr.x],
-            res_tr[i_tr.p, i_tr.x]
-        )
-
-    M_tail = M - M_main
-    if (M_tail > 0) and (N_main > 0):
-        i_bl = nl.mgrid[0:M_tail, 0:N_main]
-        res_bl = nl.zeros((M_tail, N_main), dtype=nl.float32, buffer=nl.psum)
-        for kk in nl.sequential_range(K):
-            lhs_col = nl.load(lhs[M_main + i_bl.p, kk])    
-            rhs_col = nl.load(rhs[kk, i_bl.x])              
-            res_bl[i_bl.p, i_bl.x] += lhs_col[i_bl.p] * rhs_col[i_bl.x]
-
-        nl.store(
-            result[M_main + i_bl.p, i_bl.x],
-            res_bl[i_bl.p, i_bl.x]
-        )
-
-    if (M_tail > 0) and (N_tail > 0):
-        i_br = nl.mgrid[0:M_tail, 0:N_tail]
-        res_br = nl.zeros((M_tail, N_tail), dtype=nl.float32, buffer=nl.psum)
-        for kk in nl.sequential_range(K):
-            lhs_col = nl.load(lhs[M_main + i_br.p, kk])        # shape [M_tail]
-            rhs_col = nl.load(rhs[kk, N_main + i_br.x])        # shape [N_tail]
-            res_br[i_br.p, i_br.x] += lhs_col[i_br.p] * rhs_col[i_br.x]
-
-        nl.store(
-            result[M_main + i_br.p, N_main + i_br.x],
-            res_br[i_br.p, i_br.x]
-        )
-
     return result
 
 @nki.jit
@@ -945,147 +1103,6 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
 
     return out_ref
 
-
-@nki.jit
-def nki_matmul_quantized_fp8_rhs(
-    lhsT,
-    rhs_fp8,
-    # Meta-parameters
-    TILES_IN_BLOCK_M=16,
-    TILES_IN_BLOCK_N=2,
-    TILES_IN_BLOCK_K=8,
-):
-
-    # Dimensions
-    K, M = lhsT.shape        # lhsT is shape [K, M]
-    K_, N = rhs_fp8.shape    # rhs_fp8 is shape [K, N]
-    assert K == K_, "lhsT and rhs_fp8 must have the same K dimension"
-
-    # Prepare the result in BF16
-    result = nl.ndarray((M, N), dtype=nl.bfloat16, buffer=nl.shared_hbm)
-
-    # Tiling sizes derived from hardware constraints
-    TILE_M = nl.tile_size.gemm_stationary_fmax  # Typically 128
-    TILE_K = nl.tile_size.pmax                  # Typically 128
-    TILE_N = nl.tile_size.gemm_moving_fmax      # Typically 512
-
-    BLOCK_M = TILE_M * TILES_IN_BLOCK_M
-    BLOCK_N = TILE_N * TILES_IN_BLOCK_N
-    BLOCK_K = TILE_K * TILES_IN_BLOCK_K
-
-    # Validate that M, N, K are multiples of block sizes
-    assert M % BLOCK_M == 0, f"M={M} not multiple of BLOCK_M={BLOCK_M}"
-    assert N % BLOCK_N == 0, f"N={N} not multiple of BLOCK_N={BLOCK_N}"
-    assert K % BLOCK_K == 0, f"K={K} not multiple of BLOCK_K={BLOCK_K}"
-
-    NUM_BLOCK_M = M // BLOCK_M
-    NUM_BLOCK_N = N // BLOCK_N
-    NUM_BLOCK_K = K // BLOCK_K
-
-    # -------------------------------------------------------------------------
-    # 1) Load the entire FP8 rhs into on-chip memory (SBUF) just once
-    # -------------------------------------------------------------------------
-    # ***IMPORTANT***: This requires that K*N fits in on-chip memory, which
-    # may be very large. If rhs is too big, you need a more advanced tiling approach.
-    rhs_sbuf = nl.ndarray((K, N), dtype=nl.float8_e4m3, buffer=nl.sbuf)
-    rhs_sbuf[...] = nl.load(rhs_fp8)  # single load from HBM -> SBUF
-    # Now 'rhs_sbuf' holds the entire rhs in FP8 E4M3 format on-chip.
-
-    # -------------------------------------------------------------------------
-    # 2) Matrix Multiply: For each block of M, N, K
-    # -------------------------------------------------------------------------
-    for n in nl.affine_range(NUM_BLOCK_N):
-        # result_tiles shape => (NUM_BLOCK_M, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N)
-        # We'll accumulate partial results in BF16 (instead of float32).
-        result_tiles = nl.zeros((NUM_BLOCK_M, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N,
-                                 nl.par_dim(TILE_M), TILE_N),
-                                dtype=nl.bfloat16,  # partial sums in BF16
-                                buffer=nl.sbuf)
-
-        # ---------------------------------------------------------------------
-        # 2a) Block over K dimension
-        # ---------------------------------------------------------------------
-        for k_blk in nl.sequential_range(NUM_BLOCK_K):
-            # We'll load sub-tiles of 'lhsT' from HBM repeatedly.
-            # But for rhs, we have everything in rhs_sbuf. We just index from it.
-
-            # Prepare a SBUF buffer for sub-tiles of shape (TILES_IN_BLOCK_K, TILE_K, BLOCK_N).
-            i_rhs = nl.mgrid[0:TILE_K, 0:BLOCK_N]
-            rhs_tiles = nl.ndarray((TILES_IN_BLOCK_K, nl.par_dim(TILE_K), BLOCK_N),
-                                   dtype=nl.bfloat16,  # We'll cast FP8->BF16
-                                   buffer=nl.sbuf)
-
-            # Load sub-blocks of 'rhs_sbuf' from on-chip memory (FP8) and cast to BF16
-            for bk_r in nl.affine_range(TILES_IN_BLOCK_K):
-                # Indices for the K dimension
-                k_offset = (TILES_IN_BLOCK_K * k_blk + bk_r) * TILE_K
-                rhs_tiles[bk_r, i_rhs.p, i_rhs.x] = nl.cast(
-                    rhs_sbuf[k_offset + i_rhs.p, BLOCK_N * n + i_rhs.x],
-                    dtype=nl.bfloat16
-                )
-
-            # -----------------------------------------------------------------
-            # 2b) Block over M dimension
-            # -----------------------------------------------------------------
-            for m in nl.affine_range(NUM_BLOCK_M):
-                # Load sub-blocks of lhsT (still in BF16) from HBM
-                i_lhsT = nl.mgrid[0:TILE_K, 0:BLOCK_M]
-                lhsT_tiles = nl.ndarray((TILES_IN_BLOCK_K, nl.par_dim(TILE_K), BLOCK_M),
-                                        dtype=lhsT.dtype,  # BF16
-                                        buffer=nl.sbuf)
-                for bk_l in nl.affine_range(TILES_IN_BLOCK_K):
-                    lhsT_tiles[bk_l, i_lhsT.p, i_lhsT.x] = nl.load(
-                        lhsT[(TILES_IN_BLOCK_K * k_blk + bk_l) * TILE_K + i_lhsT.p,
-                             BLOCK_M * m + i_lhsT.x])
-
-                # -------------------------------------------------------------
-                # 2c) Perform the local matmul across sub-tiles
-                # -------------------------------------------------------------
-                i_lhsT_mm = nl.mgrid[0:TILE_K, 0:TILE_M]   # shape => [TILE_K, TILE_M]
-                i_rhs_mm = nl.mgrid[0:TILE_K, 0:TILE_N]    # shape => [TILE_K, TILE_N]
-                i_res_mm = nl.mgrid[0:TILE_M, 0:TILE_N]    # shape => [TILE_M, TILE_N]
-
-                for bn in nl.affine_range(TILES_IN_BLOCK_N):
-                    for bm in nl.affine_range(TILES_IN_BLOCK_M):
-                        # BF16 partial sum tile
-                        res_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.bfloat16, buffer=nl.psum)
-
-                        # Loop over TILES_IN_BLOCK_K to accumulate partial products
-                        for bk in nl.affine_range(TILES_IN_BLOCK_K):
-                            # Multiply LHS (BF16) with RHS (BF16).
-                            # nisa.nc_matmul automatically promotes to higher precision internally
-                            # then accumulates into BF16 partial sum.
-                            lhs_sub = lhsT_tiles[bk, i_lhsT_mm.p, bm * TILE_M + i_lhsT_mm.x]
-                            rhs_sub = rhs_tiles[bk, i_rhs_mm.p, bn * TILE_N + i_rhs_mm.x]
-                            res_tile[...] += nisa.nc_matmul(lhs_sub, rhs_sub)
-
-                        # Add partial sums to result_tiles in BF16
-                        result_tiles[m, bm, bn, i_res_mm.p, i_res_mm.x] += res_tile[
-                            i_res_mm.p, i_res_mm.x
-                        ]
-
-        # ---------------------------------------------------------------------
-        # 2d) Copy partial results from SBUF to final result in HBM
-        # ---------------------------------------------------------------------
-        for m in nl.affine_range(NUM_BLOCK_M):
-            for bm in nl.affine_range(TILES_IN_BLOCK_M):
-                i_res = nl.mgrid[0:TILE_K, 0:TILE_N]
-                i_res_packed = nl.mgrid[0:TILE_K, 0:BLOCK_N]
-                result_packed = nl.ndarray((TILE_K, BLOCK_N),
-                                           dtype=result_tiles.dtype,
-                                           buffer=nl.sbuf)
-                # Coalesce tiles for better DMA
-                for bn in nl.affine_range(TILES_IN_BLOCK_N):
-                    result_packed[i_res.p, bn * TILE_N + i_res.x] = nl.copy(
-                        result_tiles[m, bm, bn, i_res.p, i_res.x]
-                    )
-                # Finally store to 'result' in BF16
-                nl.store(result[(TILES_IN_BLOCK_M * m + bm) * TILE_K + i_res_packed.p,
-                                BLOCK_N * n + i_res_packed.x],
-                         value=result_packed[i_res_packed.p, i_res_packed.x])
-
-    return result
-
 @nki.jit
 def tensor_transpose2D_kernel_(in_tensor, shape2D):
     out_tensor = nl.ndarray(in_tensor.shape, dtype=in_tensor.dtype,
@@ -1167,60 +1184,6 @@ def nki_matmul_basic_(lhsT, rhs):
     # This dictates which indices to use to address the result tile.
     nl.store(result[i_out_p, i_out_f], value=result_sbuf)
 
-    return result
-
-@nki.jit
-def nki_matmul_tiled_(lhsT, rhs):
-    """NKI kernel to compute a matrix multiplication operation in a tiled manner
-
-    Args:
-        lhsT: an input tensor of shape [K,M], where both K and M are multiples for
-            128.  It is the left-hand-side argument of the matrix multiplication,
-            delivered transposed for optimal performance.
-        rhs: an input tensor of shape [K,N], where K is a multiple of 128, and N
-            is a multiple of 512.  It is the right-hand-side argument of the matrix
-            multiplication.
-    Returns:
-        result: the resulting output tensor of shape [M,N]
-    """
-
-    K, M = lhsT.shape
-    # print(K, M)
-    K_, N = rhs.shape
-    # print(K_, N)
-    assert K == K_, "lhsT and rhs must have the same contraction dimension"
-    result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
-
-    # TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-    TILE_M = 1
-    TILE_K = nl.tile_size.pmax  # 128
-    TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-
-    # Use affine_range to loop over tiles
-    for m in nl.affine_range(M // TILE_M):
-        for n in nl.affine_range(N // TILE_N):
-            # Allocate a tensor in PSUM
-            res_psum = nl.zeros((TILE_M, TILE_N), nl.float32, buffer=nl.psum)
-
-            for k in nl.affine_range(K // TILE_K):
-                # Declare the tiles on SBUF
-                lhsT_tile = nl.ndarray((TILE_K, TILE_M), dtype=lhsT.dtype, buffer=nl.sbuf)
-                rhs_tile = nl.ndarray((TILE_K, TILE_N), dtype=rhs.dtype, buffer=nl.sbuf)
-
-                # Load tiles from lhsT and rhs
-                lhsT_tile[...] = nl.load(lhsT[k * TILE_K:(k + 1) * TILE_K,
-                                            m * TILE_M:(m + 1) * TILE_M])
-                rhs_tile[...] = nl.load(rhs[k * TILE_K:(k + 1) * TILE_K,
-                                            n * TILE_N:(n + 1) * TILE_N])
-
-                # Accumulate partial-sums into PSUM
-                res_psum += nl.matmul(lhsT_tile[...], rhs_tile[...], transpose_x=True)
-
-            # Copy the result from PSUM back to SBUF, and cast to expected output data-type
-            res_sb = nl.copy(res_psum, dtype=result.dtype)
-            nl.store(result[m * TILE_M:(m + 1) * TILE_M, n * TILE_N:(n + 1) * TILE_N],
-                value=res_sb)
-    # logger.debug("nki函数被调用")
     return result
 
 @nki.jit
@@ -1983,17 +1946,124 @@ class NeuronLlamaMLP(nn.Module):
         #     # print("result[i]:", result[i].size())
         # gate_proj_output = result
 
+
+######################################################################################################################################################
+
         gate_proj_output = torch.matmul(x, self.gate_proj.weight.T)
         up_proj_output = torch.matmul(x, self.up_proj.weight.T)
-        # gate_proj_output = (
-        #     self.gate_proj(x)
-        #     if not is_lora_module(self.gate_proj)
-        #     else self.gate_proj(x, adapter_ids)
+
+######################################################################################################################################################
+
+        # B, N, C = x.shape   # For example, B * N = 32, C = 2048
+        # M_orig = B * N      # Original M dimension (32)
+
+        # # We need M to be a multiple of 256 = 128 x 2core.
+        # BLOCK_M = 256
+        # M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M  # Next multiple of 256
+
+        # # Flatten x to 2D: [B*N, C]
+        # x_flat_padded = x.view(M_orig, C) # was called x_flat
+        # gate_weight_T = self.gate_proj.weight.T
+        # up_weight_T = self.up_proj.weight.T
+        # # Pad x_flat along dimension 0 if needed.
+        # if M_pad > M_orig:
+        #     pad_rows = M_pad - M_orig
+        #     pad = torch.zeros(pad_rows, C, dtype=x.dtype, device=x.device)
+        #     x_flat_padded = torch.cat([x_flat_padded, pad], dim=0)
+
+        # x_flat_padded_T = x_flat_padded.T
+        # MDIM = x_flat_padded.shape[0]
+        # NDIM = self.gate_proj.weight.shape[0]
+        # KDIM = self.gate_proj.weight.shape[1]
+
+        # Mtile = MDIM // 128 // 2 ### 2 cores
+        # Ntile = NDIM // 512
+        # Ktile = KDIM // 128 
+
+        # # gate_proj_output = (
+        # #     self.gate_proj(x)
+        # #     if not is_lora_module(self.gate_proj)
+        # #     else self.gate_proj(x, adapter_ids)
+        # # )
+        # output_padded = nki_matmul_fully_optimized_spmd_[nl.nc(2)](x_flat_padded_T, gate_weight_T, Mtile, Ntile, Ktile, 2)
+        # output_flat = output_padded[:M_orig, :]
+        # gate_proj_output = output_flat.view(B, N, -1)
+
+        # # up_proj_output = (
+        # #     self.up_proj(x) if not is_lora_module(self.up_proj) else self.up_proj(x, adapter_ids)
+        # # )
+        # up_output_padded = nki_matmul_fully_optimized_spmd_[nl.nc(2)](x_flat_padded_T, up_weight_T, Mtile, Ntile, Ktile, 2)        
+        # up_output_flat = up_output_padded[:M_orig, :]
+        # up_proj_output = up_output_flat.view(B, N, -1)
+
+######################################################################################################################################################
+
+        # gate_weight = self.gate_proj.weight.T
+        # up_weight = self.up_proj.weight.T
+
+        # BLOCK_M = 256        # or whatever multiple of 128 * #cores you use
+
+        # B, N_, C = x.shape
+        # M_orig = B * N_          # e.g. 32 in your example
+
+        # # We need M to be multiple of 256=128x2 for 2-core parallel
+        # M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M
+
+        # # Flatten x to [M_orig, C]
+        # x_flat = x.view(M_orig, C)
+
+        # if M_pad > M_orig:
+        #     pad_rows = M_pad - M_orig
+        #     pad = torch.zeros(pad_rows, C, dtype=x.dtype, device=x.device)
+        #     x_flat_padded = torch.cat([x_flat, pad], dim=0)
+        # else:
+        #     x_flat_padded = x_flat
+
+        # # Transpose to match kernel’s shape (K= C, M= M_pad)
+        # x_flat_padded_T = x_flat_padded.T  # shape (C, M_pad)
+
+        # # -- Horizontally concat gate & up weight: shape (C, out1 + out2)
+        # combined_weight = torch.cat([gate_weight, up_weight], dim=1)
+        # out1 = gate_weight.shape[1]
+        # out2 = up_weight.shape[1]
+        # assert combined_weight.shape == (C, out1 + out2)
+
+        # # Decide tiling parameters exactly as you do now
+        # MDIM = x_flat_padded.shape[0]    # = M_pad
+        # KDIM = C                         # same as kernel "K"
+        # NDIM = out1 + out2              # total columns
+
+        # # e.g. for 2 cores, tile M dim in multiples of 128, etc.
+        # Mtile = MDIM // 128 // 2
+        # Ntile = NDIM // 512
+        # Ktile = KDIM // 128
+
+        # # -- Single kernel call for both gate & up
+        # big_output_padded = nki_matmul_fully_optimized_spmd_proj_fused[
+        #     nl.nc(2)
+        # ](
+        #     x_flat_padded_T,    # shape (C, M_pad) => (K, M)
+        #     combined_weight,  # shape (C, out1+out2) => (K, N)
+        #     Mtile,
+        #     Ntile,
+        #     Ktile,
+        #     2    # spmd_m=2
         # )
-        # up_proj_output = (
-        #     self.up_proj(x) if not is_lora_module(self.up_proj) else self.up_proj(x, adapter_ids)
-        # )
-        ################################################################################################################################
+
+        # # big_output_padded has shape (M_pad, out1+out2)
+        # # Slice off the padding, if any
+        # big_output_flat = big_output_padded[:M_orig, :]  # (M_orig, out1+out2)
+
+        # # Split columns
+        # gate_output_flat = big_output_flat[:, :out1]      # (M_orig, out1)
+        # up_output_flat   = big_output_flat[:, out1:]      # (M_orig, out2)
+
+        # # Reshape back to [B, N_, ...]
+        # gate_proj_output = gate_output_flat.view(B, N_, out1)
+        # up_proj_output   = up_output_flat.view(B, N_, out2)
+
+######################################################################################################################################################
+
         # down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
 
         # 1) Get their shapes
@@ -2034,14 +2104,13 @@ class NeuronLlamaMLP(nn.Module):
         # 5) Un-flatten back to 3D
         down_proj_input = nki_actfn_output_2d.view(B1, L1, E1)
 
-        ################################################################################################################################
+################################################################################################################################
 
         output = (
             self.down_proj(down_proj_input)
             if not is_lora_module(self.up_proj)
             else self.down_proj(down_proj_input, adapter_ids)
         )
-
         return output
 
     def forward(self, x, rmsnorm=None, residual=None, adapter_ids=None):
