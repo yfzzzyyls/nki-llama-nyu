@@ -1,0 +1,112 @@
+{
+  "Average": {
+    "tensorizer": {
+      "StaticProfiler::AverageFractalPeUtilizationPercent": 103.86063385009766,
+      "StaticProfiler::AveragePartitionUtilizationPercent": 101.31607055664063,
+      "StaticProfiler::AveragePeUtilizationPercent": 94.33395385742188,
+      "StaticProfiler::LocalizationEfficiency": 122.72288513183594,
+      "StaticProfiler::LocalizationEfficiencyIgnoreNonlocal": 122.76287841796875,
+      "TilingProfiler::AveragePartitionUtilizationAfterTilingPercent": 0,
+      "TilingProfiler::AveragePeUtilizationAfterTilingPercent": 0
+    }
+  },
+  "Count": {
+    "tensorizer": {
+      "StaticProfiler::AverageFractalPeUtilizationPercent": 1,
+      "StaticProfiler::AveragePartitionUtilizationPercent": 1,
+      "StaticProfiler::AveragePeUtilizationPercent": 1,
+      "StaticProfiler::LocalizationEfficiency": 1,
+      "StaticProfiler::LocalizationEfficiencyIgnoreNonlocal": 1,
+      "TilingProfiler::AveragePartitionUtilizationAfterTilingPercent": 1,
+      "TilingProfiler::AveragePeUtilizationAfterTilingPercent": 1
+    }
+  },
+  "Sum": {
+    "hilo": {
+      "HloMacCount": 622084096.0,
+      "TrafficInBytes": 1510071808.0
+    },
+    "tensorizer": {
+      "StaticProfiler::AifUbFlopsPerByte": 0.9383800029754639,
+      "StaticProfiler::ArithmeticIntensityTensorizerFlopsPerByte": 1.1516069173812866,
+      "StaticProfiler::AverageDmaLengthBytes": 5860.18798828125,
+      "StaticProfiler::DDRTransferBytes": 1238832012,
+      "StaticProfiler::InternalTransferBytes": 1963524,
+      "StaticProfiler::LoadExpanded": 193588,
+      "StaticProfiler::StoreExpanded": 643,
+      "StaticProfiler::TotalDMAExpanded": 194231,
+      "StaticProfiler::TotalDynamicInstancesCount": 48006,
+      "StaticProfiler::TotalDynamicInstancesWithMmPackedCount": 42742,
+      "StaticProfiler::TotalLNCComm": 0,
+      "StaticProfiler::TotalLNCCommTransfer": 0,
+      "TilingProfiler::BatchnormInstructionsAfterTiling": 0,
+      "TilingProfiler::DmaInstructionsAfterTiling": 0,
+      "TilingProfiler::GenericInstructionsAfterTiling": 34,
+      "TilingProfiler::MatMultInstructionsAfterTiling": 43024,
+      "TilingProfiler::NumPfTransposes": 178,
+      "TilingProfiler::NumPfTransposesForIo": 16,
+      "TilingProfiler::NumPfTransposesForLocal": 96,
+      "TilingProfiler::NumPfTransposesForNonlocal": 66,
+      "TilingProfiler::PfTransposeInstructions": 229,
+      "TilingProfiler::PfTransposeInstructionsForIo": 64,
+      "TilingProfiler::PfTransposeInstructionsForLocal": 96,
+      "TilingProfiler::PfTransposeInstructionsForNonlocal": 69,
+      "TilingProfiler::ReduceInstructionsAfterTiling": 32,
+      "TilingProfiler::SimdInstructionsAfterTiling": 786,
+      "TransformConvOp::Conv1d_depthwise_bf01_oi01_bf01": 0,
+      "TransformConvOp::Conv2d_dw_fb01_io01_01bf_rep_nhwc_Pcinh": 0,
+      "TransformConvOp::Conv2d_pbp_0f1b_0i1o_01fb_experimental_1": 0,
+      "TransformConvOp::Conv2d_pbp_fb01_io01_01bf_experimental_1": 0,
+      "TransformConvOp::conv2d_column_packing": 0
+    }
+  },
+  "sg00": {
+    "hilo": {
+      "ArithmeticIntensityFlopsPerByte": 0.8239132761955261,
+      "HloMacCount": 622084096.0,
+      "TrafficInBytes": 1510071808.0
+    }
+  },
+  "sg0000": {
+    "tensorizer": {
+      "StaticProfiler::AifUbFlopsPerByte": 0.9383800029754639,
+      "StaticProfiler::ArithmeticIntensityTensorizerFlopsPerByte": 1.1516069173812866,
+      "StaticProfiler::AverageDmaLengthBytes": 5860.18798828125,
+      "StaticProfiler::AverageFractalPeUtilizationPercent": 103.86063385009766,
+      "StaticProfiler::AveragePartitionUtilizationPercent": 101.31607055664063,
+      "StaticProfiler::AveragePeUtilizationPercent": 94.33395385742188,
+      "StaticProfiler::DDRTransferBytes": 1238832012,
+      "StaticProfiler::InternalTransferBytes": 1963524,
+      "StaticProfiler::LoadExpanded": 193588,
+      "StaticProfiler::LocalizationEfficiency": 122.72288513183594,
+      "StaticProfiler::LocalizationEfficiencyIgnoreNonlocal": 122.76287841796875,
+      "StaticProfiler::StoreExpanded": 643,
+      "StaticProfiler::TotalDMAExpanded": 194231,
+      "StaticProfiler::TotalDynamicInstancesCount": 48006,
+      "StaticProfiler::TotalDynamicInstancesWithMmPackedCount": 42742,
+      "StaticProfiler::TotalLNCComm": 0,
+      "StaticProfiler::TotalLNCCommTransfer": 0,
+      "TilingProfiler::AveragePartitionUtilizationAfterTilingPercent": 0,
+      "TilingProfiler::AveragePeUtilizationAfterTilingPercent": 0,
+      "TilingProfiler::BatchnormInstructionsAfterTiling": 0,
+      "TilingProfiler::DmaInstructionsAfterTiling": 0,
+      "TilingProfiler::GenericInstructionsAfterTiling": 34,
+      "TilingProfiler::MatMultInstructionsAfterTiling": 43024,
+      "TilingProfiler::NumPfTransposes": 178,
+      "TilingProfiler::NumPfTransposesForIo": 16,
+      "TilingProfiler::NumPfTransposesForLocal": 96,
+      "TilingProfiler::NumPfTransposesForNonlocal": 66,
+      "TilingProfiler::PfTransposeInstructions": 229,
+      "TilingProfiler::PfTransposeInstructionsForIo": 64,
+      "TilingProfiler::PfTransposeInstructionsForLocal": 96,
+      "TilingProfiler::PfTransposeInstructionsForNonlocal": 69,
+      "TilingProfiler::ReduceInstructionsAfterTiling": 32,
+      "TilingProfiler::SimdInstructionsAfterTiling": 786,
+      "TransformConvOp::Conv1d_depthwise_bf01_oi01_bf01": 0,
+      "TransformConvOp::Conv2d_dw_fb01_io01_01bf_rep_nhwc_Pcinh": 0,
+      "TransformConvOp::Conv2d_pbp_0f1b_0i1o_01fb_experimental_1": 0,
+      "TransformConvOp::Conv2d_pbp_fb01_io01_01bf_experimental_1": 0,
+      "TransformConvOp::conv2d_column_packing": 0
+    }
+  }
+}
