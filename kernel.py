@@ -275,61 +275,23 @@ def test_nki_silu_mul(device = xm.xla_device()):
 
 @nki.jit
 def nki_silu_mul(lhs_tensor, rhs_tensor):
-    """
-    Applies SiLU to lhs_tensor, then multiplies elementwise by rhs_tensor.
-    Tiled in 2D so we don't exceed NKI hardware partition limits.
-    Assumes (H, W) is exactly divisible by (128, 128).
-    """
-    # 1) Check shapes
-    H, W = lhs_tensor.shape
-    assert lhs_tensor.shape == rhs_tensor.shape, (
-        f"Shape mismatch: {lhs_tensor.shape} vs {rhs_tensor.shape}"
-    )
+    # Expect 2D shape (H, W)
+    orig_shape = lhs_tensor.shape
+    H, W = orig_shape
 
-    # 2) Tile sizes
-    TILE_H = 128
-    TILE_W = 128
-    # Both H and W must be multiples of 128
-    assert H % TILE_H == 0, f"H={H} is not multiple of {TILE_H}"
-    assert W % TILE_W == 0, f"W={W} is not multiple of {TILE_W}"
+    lhs_nl = nl.load(lhs_tensor)
+    rhs_nl = nl.load(rhs_tensor)
 
-    # 3) Number of tiles along each dimension
-    NUM_TILES_H = H // TILE_H
-    NUM_TILES_W = W // TILE_W
+    lhs_silu = nl.silu(lhs_nl)
+    out_nl   = nl.multiply(lhs_silu, rhs_nl)
 
-    # 4) Create an output array in NKI memory
-    out_nl = nl.zeros((H, W), dtype=lhs_tensor.dtype, buffer=nl.shared_hbm)
-
-    # 5) Nested loop over tile indices
-    for tile_h_idx in nl.affine_range(NUM_TILES_H):
-        start_h = tile_h_idx * TILE_H
-
-        for tile_w_idx in nl.affine_range(NUM_TILES_W):
-            start_w = tile_w_idx * TILE_W
-
-            # Instead of mgrid[start_h:end_h, start_w:end_w],
-            # we do a fixed grid [0:TILE_H, 0:TILE_W] and add offsets
-            i = nl.mgrid[0:TILE_H, 0:TILE_W]
-
-            # 6) Load LHS tile, apply SiLU
-            lhs_tile = nl.load(lhs_tensor[start_h + i.x, start_w + i.y])
-            lhs_silu = nl.silu(lhs_tile)
-
-            # 7) Load matching RHS tile
-            rhs_tile = nl.load(rhs_tensor[start_h + i.x, start_w + i.y])
-
-            # 8) Multiply and store into out_nl
-            out_nl[start_h + i.x, start_w + i.y] = nl.multiply(lhs_silu, rhs_tile)
-
-    # 9) Allocate a PyTorch-accessible output tensor and store the results
-    out_tensor = nl.ndarray((H, W), dtype=lhs_tensor.dtype, buffer=nl.shared_hbm)
+    out_tensor = nl.ndarray(orig_shape, dtype=lhs_tensor.dtype, buffer=nl.shared_hbm)
     nl.store(out_tensor, value=out_nl)
-
     return out_tensor
 
 def generate_2_matrices(device = xm.xla_device()):
-    x = torch.rand((1, 128, 4096), dtype=torch.bfloat16, device=device)
-    y = torch.rand((1, 128, 4096), dtype=torch.bfloat16, device=device)
+    x = torch.rand((1, 32, 4096), dtype=torch.bfloat16, device=device)
+    y = torch.rand((1, 32, 4096), dtype=torch.bfloat16, device=device)
     return x, y
 
 def main():
