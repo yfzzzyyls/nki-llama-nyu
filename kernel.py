@@ -242,13 +242,10 @@ def test_nki_silu_mul(device = xm.xla_device()):
     # Generate two random 3D tensors of shape (B, L, E)
     lhs, rhs = generate_2_matrices(device)  # e.g. (1, 32, 4096)
 
-    # 1) Get their shapes
     B1, L1, E1 = lhs.shape
     B2, L2, E2 = rhs.shape
 
-    # 2) (Optional) Assert shapes match how you expect
-    #    The question is: "Is B always the same for both matrices?"
-    #    If your code depends on them matching, you can assert that:
+    # 2) (Optional) Assert shapes match
     assert B1 == B2, f"B mismatch: {B1} != {B2}"
     assert L1 == L2, f"L mismatch: {L1} != {L2}"
     assert E1 == E2, f"E mismatch: {E1} != {E2}"
@@ -257,10 +254,29 @@ def test_nki_silu_mul(device = xm.xla_device()):
     lhs_2d = lhs.view(B1 * L1, E1)
     rhs_2d = rhs.view(B2 * L2, E2)
 
+    M_orig = B1 * L1      # Original M dimension (32)
+
+    # We need M to be a multiple of 256 = 128 x 2core.
+    BLOCK_M = 128
+    M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M  # Next multiple of 256
+
+    if M_pad > M_orig:
+        pad_rows = M_pad - M_orig
+        pad = torch.zeros(pad_rows, E1, dtype=lhs.dtype, device=lhs.device)
+        lhs_2d_padded = torch.cat([lhs_2d, pad], dim=0)
+        rhs_2d_padded = torch.cat([rhs_2d, pad], dim=0)
+    else:
+        lhs_2d_padded = lhs_2d
+        rhs_2d_padded = rhs_2d
+
     # 4) Run the NKI SiLU + multiply kernel on 2D
-    print("lhs_2d.shape =", lhs_2d.shape)
-    print("rhs_2d.shape =", rhs_2d.shape)
-    nki_actfn_output_2d = nki_silu_mul(lhs_2d, rhs_2d)
+    print("lhs_2d_padded.shape =", lhs_2d_padded.shape)
+    print("rhs_2d_padded.shape =", rhs_2d_padded.shape)
+    nki_actfn_output_2d_padded = nki_silu_mul(lhs_2d_padded, rhs_2d_padded)
+    if M_pad > M_orig:
+        nki_actfn_output_2d = nki_actfn_output_2d_padded[:M_orig, :]
+    else:
+        nki_actfn_output_2d = nki_actfn_output_2d_padded
 
     # 5) Un-flatten back to 3D
     nki_actfn_output_3d = nki_actfn_output_2d.view(B1, L1, E1)
@@ -272,22 +288,92 @@ def test_nki_silu_mul(device = xm.xla_device()):
     # 7) Compare the two outputs
     check_2matrices_match(default_actfn_output_3d, nki_actfn_output_3d)
 
-
 @nki.jit
 def nki_silu_mul(lhs_tensor, rhs_tensor):
-    # Expect 2D shape (H, W)
-    orig_shape = lhs_tensor.shape
-    H, W = orig_shape
+    """
+    Tile-based SiLU + Multiply kernel.
+    - We split the rows into blocks of 128
+    - We split the columns into blocks of 512
+    - Each tile (128 x 512) is processed in ephemeral memory (sbuf).
+    
+    Requirements:
+      1) lhs_tensor.shape == rhs_tensor.shape == (H, W)
+      2) H is multiple of 128, W is multiple of 512
+      3) (128 x 512) fits in ephemeral memory
 
-    lhs_nl = nl.load(lhs_tensor)
-    rhs_nl = nl.load(rhs_tensor)
+    For each tile:
+      - We load from HBM into ephemeral array (out_nl_tile),
+      - Apply SiLU on LHS tile, multiply by RHS tile,
+      - Write results back to HBM.
+    """
+    # 1) Validate shape
+    H, W = lhs_tensor.shape
+    assert lhs_tensor.shape == rhs_tensor.shape, (
+        f"Shape mismatch: {lhs_tensor.shape} vs {rhs_tensor.shape}"
+    )
+    # For simplicity, require exact multiples
+    TILE_H = 128
+    TILE_W = 512
+    assert H % TILE_H == 0, f"H={H} not multiple of 128"
+    assert W % TILE_W == 0, f"W={W} not multiple of 512"
 
-    lhs_silu = nl.silu(lhs_nl)
-    out_nl   = nl.multiply(lhs_silu, rhs_nl)
+    # 2) Allocate the final output in HBM
+    out_tensor = nl.ndarray((H, W), dtype=lhs_tensor.dtype, buffer=nl.shared_hbm)
 
-    out_tensor = nl.ndarray(orig_shape, dtype=lhs_tensor.dtype, buffer=nl.shared_hbm)
-    nl.store(out_tensor, value=out_nl)
+    # 3) Calculate number of tiles
+    num_tiles_h = H // TILE_H
+    num_tiles_w = W // TILE_W
+
+    # 4) Nested loop over row-tiles and column-tiles
+    for tile_h_idx in nl.affine_range(num_tiles_h):
+        start_h = tile_h_idx * TILE_H
+
+        for tile_w_idx in nl.affine_range(num_tiles_w):
+            start_w = tile_w_idx * TILE_W
+
+            # Allocate a tile in ephemeral memory: shape (128, 512)
+            out_nl_tile = nl.zeros((TILE_H, TILE_W), dtype=lhs_tensor.dtype, buffer=nl.sbuf)
+
+            # We'll do a 2D loop or mgrid over the tile. 
+            # For clarity, we use scalar loops with affine_range:
+            for r in nl.affine_range(TILE_H):
+                for c in nl.affine_range(TILE_W):
+                    # Global indices
+                    gr = start_h + r
+                    gc = start_w + c
+
+                    # 1) Load LHS and apply SiLU
+                    lhs_val  = nl.load(lhs_tensor[gr, gc])
+                    lhs_silu = nl.silu(lhs_val)
+
+                    # 2) Load RHS
+                    rhs_val  = nl.load(rhs_tensor[gr, gc])
+
+                    # 3) Multiply, store in ephemeral tile
+                    out_nl_tile[r, c] = nl.multiply(lhs_silu, rhs_val)
+
+            # 5) Now copy ephemeral tile to final HBM output
+            nl.store(out_tensor[start_h : start_h + TILE_H, start_w : start_w + TILE_W],
+                     value=out_nl_tile)
+
+    # 6) Return the final HBM tensor
     return out_tensor
+
+# @nki.jit
+# def nki_silu_mul(lhs_tensor, rhs_tensor):
+#     # Expect 2D shape (H, W)
+#     orig_shape = lhs_tensor.shape
+#     H, W = orig_shape
+
+#     lhs_nl = nl.load(lhs_tensor)
+#     rhs_nl = nl.load(rhs_tensor)
+
+#     lhs_silu = nl.silu(lhs_nl)
+#     out_nl   = nl.multiply(lhs_silu, rhs_nl)
+
+#     out_tensor = nl.ndarray(orig_shape, dtype=lhs_tensor.dtype, buffer=nl.shared_hbm)
+#     nl.store(out_tensor, value=out_nl)
+#     return out_tensor
 
 def generate_2_matrices(device = xm.xla_device()):
     x = torch.rand((1, 32, 4096), dtype=torch.bfloat16, device=device)
