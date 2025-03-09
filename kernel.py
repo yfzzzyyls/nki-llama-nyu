@@ -58,7 +58,7 @@ from neuronx_distributed_inference.modules.attention.utils import (
 from neuronx_distributed_inference.modules.flashdecode.utils import calculate_num_cores_per_group
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
 from neuronx_distributed_inference.utils.distributed import get_tp_group
-
+from neuronx_distributed_inference.modules.attention.utils import repeat_kv, manual_softmax
 from torch_neuronx.xla_impl.ops import RmsNorm
 
 import neuronxcc.nki as nki
@@ -341,6 +341,298 @@ def generate_2_matrices(device = xm.xla_device()):
     y = torch.rand((1, 256, 4096), dtype=torch.bfloat16, device=device)
     return x, y
 
+@nki.jit
+def fused_self_attn_2mask(q_ref, k_ref, v_ref, mask_ref,
+                          softmax_scale=0.125, mixed_precision=True):
+    """
+    Fused self-attn: out = softmax( (QK^T * scale) + mask ) * V
+    mask_ref is [seq_q, seq_k], boolean (True => keep, False => -∞).
+    Q,K,V => [seqlen, d_head], d_head <= 128, seqlen multiple-of-128.
+    """
+
+    kernel_dtype = q_ref.dtype
+    pe_in_dt = nl.bfloat16 if mixed_precision else np.float32
+
+    seqlen, d_head = q_ref.shape
+    assert k_ref.shape == (seqlen, d_head), "K shape mismatch"
+    assert v_ref.shape == (seqlen, d_head), "V shape mismatch"
+    assert mask_ref.shape == (seqlen, seqlen), "mask shape mismatch"
+    out_ref = nl.ndarray((seqlen, d_head), dtype=kernel_dtype, buffer=nl.shared_hbm)
+
+    # Tiling
+    tile_size = 128
+    assert seqlen % tile_size == 0, "Requires seqlen multiple-of-128"
+    assert d_head <= 128, "Requires d_head <= 128"
+
+    seq_n_tiles = seqlen // tile_size
+
+    # 1) Transpose V => shape [tile_size, seq_n_tiles, d_head]
+    trans_v = nl.ndarray((nl.par_dim(tile_size), seq_n_tiles, d_head), dtype=pe_in_dt)
+    for it_k in nl.affine_range(seq_n_tiles):
+        ip = nl.arange(tile_size)[:, None]
+        if_ = nl.arange(d_head)[None, :]
+        trans_v[ip, it_k, if_] = nl.load(v_ref[it_k*tile_size + ip, if_], dtype=pe_in_dt)
+
+    # 2) Transpose Q => shape [seq_n_tiles, d_head, tile_size], also multiply by scale
+    q_local = nl.ndarray((seq_n_tiles, nl.par_dim(d_head), tile_size), dtype=pe_in_dt)
+    ip_q = nl.arange(d_head)[:, None]
+    if_q = nl.arange(tile_size)[None, :]
+    for it_q in nl.affine_range(seq_n_tiles):
+        q_local[it_q, ip_q, if_q] = nl.load_transpose2d(
+            q_ref[it_q*tile_size + if_q, ip_q], dtype=pe_in_dt
+        ) * softmax_scale
+
+    # 3) Transpose K => shape [seq_n_tiles, d_head, tile_size]
+    k_local = nl.ndarray((seq_n_tiles, nl.par_dim(d_head), tile_size), dtype=pe_in_dt)
+    ip_k = nl.arange(d_head)[:, None]
+    if_k = nl.arange(tile_size)[None, :]
+    for it_k in nl.affine_range(seq_n_tiles):
+        k_local[it_k, ip_k, if_k] = nl.load_transpose2d(
+            k_ref[it_k*tile_size + if_k, ip_k], dtype=pe_in_dt
+        )
+
+    # 4) For each Q-tile => produce QK => apply mask => softmax => multiply by V
+    for it_q in nl.affine_range(seq_n_tiles):
+        # We'll store partial QK results in qk_res_buf
+        qk_res_buf = nl.ndarray((nl.par_dim(tile_size), seqlen), dtype=kernel_dtype)
+        neg_max_res = nl.ndarray((nl.par_dim(tile_size), seq_n_tiles), dtype=kernel_dtype)
+
+        ip_max = nl.arange(tile_size)[:, None]
+        if_max = nl.arange(seq_n_tiles)[None, :]
+
+        # (a) QK^T for each K-tile
+        for it_k_2 in nl.affine_range(seq_n_tiles):
+            # partial sum buffer shape [tile_size, tile_size]
+            qk_psum = nl.zeros((nl.par_dim(tile_size), tile_size),
+                               dtype=np.float32, buffer=nl.psum)
+            ip_qk = nl.arange(tile_size)[:, None]
+            if_qk = nl.arange(tile_size)[None, :]
+
+            # Multiply Q * K
+            qk_psum[ip_qk, if_qk] += nisa.nc_matmul(
+                moving=k_local[it_k_2, ip_k, if_k],
+                stationary=q_local[it_q, ip_q, if_q]
+            )
+
+            # global row, col
+            i_mask_r = (it_q*tile_size) + ip_qk
+            i_mask_c = (it_k_2*tile_size) + if_qk
+
+            bool_mask_val = nl.load(mask_ref[i_mask_r, i_mask_c], dtype=nl.bool)
+            qk_res_buf[ip_qk, it_k_2*tile_size + if_qk] = nisa.affine_select(
+                pred=bool_mask_val,
+                on_true_tile=qk_psum[ip_qk, if_qk],
+                on_false_value=-9984.0,  # approximate -inf
+                dtype=kernel_dtype
+            )
+
+            neg_max_res[ip_max, it_k_2] = nisa.tensor_reduce(
+                np.max,
+                data=qk_res_buf[ip_qk, it_k_2*tile_size + if_qk],
+                axis=(1,),
+                dtype=kernel_dtype,
+                negate=True
+            )
+
+        neg_max_res_final = nisa.tensor_reduce(
+            np.min,
+            data=neg_max_res[ip_max, if_max],
+            axis=(1,),
+            dtype=kernel_dtype,
+            negate=False
+        )
+
+        # (b) exponent + sum
+        ip_softmax = nl.arange(tile_size)[:, None]
+        if_softmax = nl.arange(seqlen)[None, :]
+        exp_res = nisa.activation(
+            np.exp,
+            data=qk_res_buf[ip_softmax, if_softmax],
+            bias=neg_max_res_final,
+            scale=1.0
+        )
+
+        sum_res = nisa.tensor_reduce(
+            np.add,
+            data=exp_res,
+            axis=(1,),
+            dtype=kernel_dtype
+        )
+
+        softmax_res = nl.ndarray((nl.par_dim(tile_size), seqlen), dtype=pe_in_dt)
+        softmax_res[ip_softmax, if_softmax] = nl.copy(exp_res, dtype=pe_in_dt)
+
+        sum_recip = 1.0 / sum_res
+        sum_divisor = nl.ndarray((nl.par_dim(tile_size), tile_size), dtype=kernel_dtype)
+        sum_divisor[...] = nl.copy(sum_recip.broadcast_to((tile_size, tile_size)), dtype=kernel_dtype)
+
+        # (c) multiply by V
+        trans_softmax_res = nl.ndarray((nl.par_dim(tile_size), seq_n_tiles, tile_size), dtype=pe_in_dt)
+        for it_k_2 in nl.affine_range(seq_n_tiles):
+            ip_scores = nl.arange(tile_size)[:, None]
+            if_scores = nl.arange(tile_size)[None, :]
+            trans_softmax_res[ip_scores, it_k_2, if_scores] = nisa.nc_transpose(
+                softmax_res[ip_scores, it_k_2*tile_size + if_scores]
+            )
+
+        attn_res_psum = nl.zeros((nl.par_dim(d_head), tile_size), dtype=np.float32, buffer=nl.psum)
+        ip_out = nl.arange(d_head)[:, None]
+        if_out = nl.arange(tile_size)[None, :]
+
+        for it_k_2 in nl.affine_range(seq_n_tiles):
+            ip_vt = nl.arange(tile_size)[:, None]
+            if_vt = nl.arange(d_head)[None, :]
+            attn_res_psum[ip_out, if_out] += nisa.nc_matmul(
+                moving=trans_softmax_res[ip_scores, it_k_2, if_scores],
+                stationary=trans_v[ip_vt, it_k_2, if_vt]
+            )
+
+        attn_res_sbuf = nl.copy(attn_res_psum[ip_out, if_out], dtype=kernel_dtype)
+
+        # multiply by sum_div
+        sum_div_trans = nisa.nc_transpose(sum_divisor[:, :tile_size])
+        attn_res_div = attn_res_sbuf * sum_div_trans
+
+        # store final
+        nl.store(
+            out_ref[it_q*tile_size + if_out, ip_out],
+            value=attn_res_div
+        )
+
+    return out_ref
+
+def compute_for_token_gen_ref(
+    Q, K, V,
+    past_key_value,
+    attention_mask,
+    active_mask,
+):
+    """
+    Original reference logic, without 'self'.
+    1. Expand 'prior' K,V from past_key_value
+    2. Expand 'active' K,V from K,V
+    3. Score => softmax => multiply => sum
+    """
+    # 1) prior
+    K_prior, V_prior = past_key_value
+    # For simplicity, skip 'repeat_kv' and assume K_prior, V_prior are correct shape
+    # If needed, do:
+    #   K_prior = repeat_kv(K_prior, num_key_value_groups)
+    #   V_prior = repeat_kv(V_prior, num_key_value_groups)
+
+    head_dim = Q.shape[-1]
+    prior_scores = torch.matmul(Q, K_prior.transpose(-2, -1)) / math.sqrt(head_dim)
+    prior_scores = torch.where(attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min)
+    prior_scores = prior_scores.float()  # do softmax in float32
+
+    # 2) active
+    # If needed, repeat
+    K_active = K
+    V_active = V
+    active_scores = torch.matmul(Q, K_active.transpose(-2, -1)) / math.sqrt(head_dim)
+    active_scores = torch.where(active_mask, active_scores, torch.finfo(active_scores.dtype).min)
+    active_scores = active_scores.float()
+
+    # 3) manual softmax => two slices => multiply => sum
+    # We'll do a simpler approach: prior_p = softmax(prior_scores), active_p = softmax(active_scores)
+    # Then total attn_prior + attn_active
+    prior_probs = torch.softmax(prior_scores, dim=-1).to(Q.dtype)
+    active_probs = torch.softmax(active_scores, dim=-1).to(Q.dtype)
+
+    attn_prior = torch.matmul(prior_probs, V_prior)
+    attn_active = torch.matmul(active_probs, V_active)
+    attn_output = attn_prior + attn_active
+    return attn_output
+
+def compute_for_token_gen_nki(
+    Q, K, V,
+    past_key_value,
+    attention_mask,
+    active_mask,
+):
+    """
+    Uses the fused_self_attn_2mask kernel twice (prior vs. active),
+    then sums the results.
+    Q, K, V shape: [B, heads, seqQ, d_head]
+    attention_mask shape: [B, heads, seqQ, seqPrior]
+    """
+    B, H, seqQ, d_head = Q.shape
+    # 1) Flatten Q -> shape [B*H*seqQ, d_head]
+    Q_2d = Q.reshape(-1, d_head)
+    # Build prior K, V
+    K_prior, V_prior = past_key_value
+    seqPrior = K_prior.shape[2]
+    Kp_2d = K_prior.reshape(B*H*seqPrior, d_head)
+    Vp_2d = V_prior.reshape(B*H*seqPrior, d_head)
+
+    # Flatten attention_mask -> shape [B*H*seqQ, B*H*seqPrior]
+    attn_mask_2d = attention_mask.reshape(B*H*seqQ, B*H*seqPrior)
+
+    # 2) fused kernel => attn_prior
+    scale = 1.0 / math.sqrt(d_head)
+    attn_prior_2d = fused_self_attn_2mask(Q_2d, Kp_2d, Vp_2d, attn_mask_2d,
+                                          softmax_scale=scale, mixed_precision=True)
+    # reshape back
+    attn_prior = attn_prior_2d.view(B, H, seqQ, d_head)
+
+    # 3) "active" K, V
+    seqActive = K.shape[2]
+    Ka_2d = K.reshape(B*H*seqActive, d_head)
+    Va_2d = V.reshape(B*H*seqActive, d_head)
+    active_mask_2d = active_mask.reshape(B*H*seqQ, B*H*seqActive)
+
+    attn_active_2d = fused_self_attn_2mask(Q_2d, Ka_2d, Va_2d, active_mask_2d,
+                                           softmax_scale=scale, mixed_precision=True)
+    attn_active = attn_active_2d.view(B, H, seqQ, d_head)
+
+    # 4) Sum and return
+    return attn_prior + attn_active
+
+def test_self_attention_blk(device = xm.xla_device()):
+    torch.manual_seed(0)
+    B, H, seqQ = 2, 3, 4
+    seqPrior, seqActive = 5, 6
+    d_head = 64
+
+    # random Q
+    Q = torch.randn((B, H, seqQ, d_head), dtype=torch.float16)
+    # random prior K,V
+    K_prior = torch.randn((B, H, seqPrior, d_head), dtype=torch.float16)
+    V_prior = torch.randn((B, H, seqPrior, d_head), dtype=torch.float16)
+    # random active K,V
+    K_active = torch.randn((B, H, seqActive, d_head), dtype=torch.float16)
+    V_active = torch.randn((B, H, seqActive, d_head), dtype=torch.float16)
+
+    past_key_value = (K_prior, V_prior)
+
+    # random boolean masks
+    attention_mask = torch.ones((B, H, seqQ, seqPrior), dtype=torch.bool)
+    # turn off some random positions
+    attention_mask[0, 0, 1, 3] = False
+    active_mask = torch.ones((B, H, seqQ, seqActive), dtype=torch.bool)
+    active_mask[1, 2, 2, 1] = False
+
+    # 1) reference
+    ref_output = compute_for_token_gen_ref(Q, K_active, V_active,
+                                           past_key_value,
+                                           attention_mask,
+                                           active_mask)
+
+    # 2) nki version
+    nki_output = compute_for_token_gen_nki(Q, K_active, V_active,
+                                           past_key_value,
+                                           attention_mask,
+                                           active_mask)
+
+    diff = (ref_output - nki_output).abs().max()
+    print("Reference shape:", ref_output.shape)
+    print("NKI shape:", nki_output.shape)
+    print("Max diff =", diff.item())
+
+    # confirm close
+    assert diff < 1e-2, f"Mismatch too large: {diff.item()}"
+    print("Test PASS")
+
 def main():
     # use Trn1 instance
     device = xm.xla_device()
@@ -349,6 +641,9 @@ def main():
 
     # test nki activation fucntion
     test_nki_silu_mul(device)
+
+    # test fused self-attention blk
+    # test_self_attention_blk(device)
 
     # nki_output, lsh, rsh = test_matmul_singletile()
     # nki_output, lsh, rsh = test_block_free()
