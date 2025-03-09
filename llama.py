@@ -28,6 +28,7 @@ import time
 from typing import List, Optional, Tuple, Type
 
 import torch
+from torch import Tensor, nn
 from neuronx_distributed.parallel_layers import parallel_state  # noqa: E402
 from neuronx_distributed.parallel_layers.layers import (  # noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402
     ColumnParallelLinear,
@@ -78,6 +79,8 @@ from neuronx_distributed_inference.modules.attention.utils import (
 from neuronx_distributed_inference.modules.flashdecode.utils import calculate_num_cores_per_group
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
 from neuronx_distributed_inference.utils.distributed import get_tp_group
+
+from neuronx_distributed_inference.modules.attention.utils import repeat_kv, manual_softmax
 
 from torch_neuronx.xla_impl.ops import RmsNorm
 
@@ -1467,6 +1470,44 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         # QK = torch.matmul(Q, K.transpose(2, 3)) / math.sqrt(self.head_dim)
         QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
         return QK
+    
+    def compute_for_token_gen(
+        self, Q, K, V, position_ids, past_key_value, attention_mask, active_mask
+    ) -> Tensor:
+        """attention computation at token generation phase"""
+        is_speculation = position_ids.shape[-1] > 1
+        print("USE SUBCLASS TOKEN GEN: is_spec is", is_speculation)
+        # Attention computation: softmax((Q.K/√dkv) + mask).V
+        # i. prior (cached) KV
+        K_prior = past_key_value[0]
+        V_prior = past_key_value[1]
+        K_prior = repeat_kv(K_prior, self.num_key_value_groups)
+        V_prior = repeat_kv(V_prior, self.num_key_value_groups)
+        prior_scores = torch.matmul(Q, K_prior.transpose(2, 3)) / math.sqrt(self.head_dim)
+        prior_scores = torch.where(
+            attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min
+        )
+        prior_scores = prior_scores.to(torch.float32)
+
+        # ii. active (current/new) KV
+        K_active = repeat_kv(K, self.num_key_value_groups)
+        V_active = repeat_kv(V, self.num_key_value_groups)
+        active_scores = torch.matmul(Q, K_active.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if is_speculation:
+            active_scores = torch.where(
+                active_mask, active_scores, torch.finfo(active_scores.dtype).min
+            )
+        active_scores = active_scores.to(torch.float32)
+
+        # iii. attention scores
+        softmax_prior, softmax_active = manual_softmax(prior_scores, active_scores, is_speculation)
+        softmax_prior, softmax_active = softmax_prior.to(Q.dtype), softmax_active.to(Q.dtype)
+        attn_prior = torch.matmul(softmax_prior, V_prior)
+        attn_active = torch.matmul(softmax_active, V_active)
+        attn_output = attn_prior + attn_active
+
+        return attn_output
+
 
 # TODO: Modularize RotaryEmbedding. See how HF transformers does it in 4.43.
 class Llama3RotaryEmbedding(nn.Module):
