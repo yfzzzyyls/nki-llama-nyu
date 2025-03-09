@@ -291,40 +291,25 @@ def test_nki_silu_mul(device = xm.xla_device()):
 @nki.jit
 def nki_silu_mul(lhs_tensor, rhs_tensor):
     """
-    Tile-based SiLU + Multiply kernel.
-    - We split the rows into blocks of 128
-    - We split the columns into blocks of 512
-    - Each tile (128 x 512) is processed in ephemeral memory (sbuf).
-    
-    Requirements:
-      1) lhs_tensor.shape == rhs_tensor.shape == (H, W)
-      2) H is multiple of 128, W is multiple of 512
-      3) (128 x 512) fits in ephemeral memory
-
-    For each tile:
-      - We load from HBM into ephemeral array (out_nl_tile),
-      - Apply SiLU on LHS tile, multiply by RHS tile,
-      - Write results back to HBM.
+    Tile-based SiLU + Multiply kernel, using nl.mgrid for 2D indexing.
     """
     # 1) Validate shape
     H, W = lhs_tensor.shape
     assert lhs_tensor.shape == rhs_tensor.shape, (
         f"Shape mismatch: {lhs_tensor.shape} vs {rhs_tensor.shape}"
     )
-    # For simplicity, require exact multiples
     TILE_H = 128
     TILE_W = 512
-    assert H % TILE_H == 0, f"H={H} not multiple of 128"
-    assert W % TILE_W == 0, f"W={W} not multiple of 512"
+    assert H % TILE_H == 0, f"H={H} not multiple of {TILE_H}"
+    assert W % TILE_W == 0, f"W={W} not multiple of {TILE_W}"
 
-    # 2) Allocate the final output in HBM
+    # 2) Allocate final output in HBM
     out_tensor = nl.ndarray((H, W), dtype=lhs_tensor.dtype, buffer=nl.shared_hbm)
 
-    # 3) Calculate number of tiles
     num_tiles_h = H // TILE_H
     num_tiles_w = W // TILE_W
 
-    # 4) Nested loop over row-tiles and column-tiles
+    # 3) Loop over tiles
     for tile_h_idx in nl.affine_range(num_tiles_h):
         start_h = tile_h_idx * TILE_H
 
@@ -334,30 +319,95 @@ def nki_silu_mul(lhs_tensor, rhs_tensor):
             # Allocate a tile in ephemeral memory: shape (128, 512)
             out_nl_tile = nl.zeros((TILE_H, TILE_W), dtype=lhs_tensor.dtype, buffer=nl.sbuf)
 
-            # We'll do a 2D loop or mgrid over the tile. 
-            # For clarity, we use scalar loops with affine_range:
-            for r in nl.affine_range(TILE_H):
-                for c in nl.affine_range(TILE_W):
-                    # Global indices
-                    gr = start_h + r
-                    gc = start_w + c
+            # 4) Use nl.mgrid to index over [0..TILE_H) x [0..TILE_W)
+            #    .p is the first dimension, .x is the second dimension
+            i_rc = nl.mgrid[0:TILE_H, 0:TILE_W]
 
-                    # 1) Load LHS and apply SiLU
-                    lhs_val  = nl.load(lhs_tensor[gr, gc])
-                    lhs_silu = nl.silu(lhs_val)
+            lhs_val  = nl.load(lhs_tensor[start_h + i_rc.p, start_w + i_rc.x])
+            lhs_silu = nl.silu(lhs_val)
+            rhs_val  = nl.load(rhs_tensor[start_h + i_rc.p, start_w + i_rc.x])
 
-                    # 2) Load RHS
-                    rhs_val  = nl.load(rhs_tensor[gr, gc])
+            # Store elementwise multiplication in the ephemeral tile
+            out_nl_tile[i_rc.p, i_rc.x] = nl.multiply(lhs_silu, rhs_val)
 
-                    # 3) Multiply, store in ephemeral tile
-                    out_nl_tile[r, c] = nl.multiply(lhs_silu, rhs_val)
+            # 5) Store ephemeral tile to final HBM output
+            nl.store(
+                out_tensor[start_h : start_h + TILE_H, start_w : start_w + TILE_W],
+                value=out_nl_tile
+            )
 
-            # 5) Now copy ephemeral tile to final HBM output
-            nl.store(out_tensor[start_h : start_h + TILE_H, start_w : start_w + TILE_W],
-                     value=out_nl_tile)
-
-    # 6) Return the final HBM tensor
     return out_tensor
+
+# @nki.jit
+# def nki_silu_mul(lhs_tensor, rhs_tensor):
+#     """
+#     Tile-based SiLU + Multiply kernel.
+#     - We split the rows into blocks of 128
+#     - We split the columns into blocks of 512
+#     - Each tile (128 x 512) is processed in ephemeral memory (sbuf).
+    
+#     Requirements:
+#       1) lhs_tensor.shape == rhs_tensor.shape == (H, W)
+#       2) H is multiple of 128, W is multiple of 512
+#       3) (128 x 512) fits in ephemeral memory
+
+#     For each tile:
+#       - We load from HBM into ephemeral array (out_nl_tile),
+#       - Apply SiLU on LHS tile, multiply by RHS tile,
+#       - Write results back to HBM.
+#     """
+#     # 1) Validate shape
+#     H, W = lhs_tensor.shape
+#     assert lhs_tensor.shape == rhs_tensor.shape, (
+#         f"Shape mismatch: {lhs_tensor.shape} vs {rhs_tensor.shape}"
+#     )
+#     # For simplicity, require exact multiples
+#     TILE_H = 128
+#     TILE_W = 512
+#     assert H % TILE_H == 0, f"H={H} not multiple of 128"
+#     assert W % TILE_W == 0, f"W={W} not multiple of 512"
+
+#     # 2) Allocate the final output in HBM
+#     out_tensor = nl.ndarray((H, W), dtype=lhs_tensor.dtype, buffer=nl.shared_hbm)
+
+#     # 3) Calculate number of tiles
+#     num_tiles_h = H // TILE_H
+#     num_tiles_w = W // TILE_W
+
+#     # 4) Nested loop over row-tiles and column-tiles
+#     for tile_h_idx in nl.affine_range(num_tiles_h):
+#         start_h = tile_h_idx * TILE_H
+
+#         for tile_w_idx in nl.affine_range(num_tiles_w):
+#             start_w = tile_w_idx * TILE_W
+
+#             # Allocate a tile in ephemeral memory: shape (128, 512)
+#             out_nl_tile = nl.zeros((TILE_H, TILE_W), dtype=lhs_tensor.dtype, buffer=nl.sbuf)
+
+#             # We'll do a 2D loop or mgrid over the tile. 
+#             # For clarity, we use scalar loops with affine_range:
+#             for r in nl.affine_range(TILE_H):
+#                 for c in nl.affine_range(TILE_W):
+#                     # Global indices
+#                     gr = start_h + r
+#                     gc = start_w + c
+
+#                     # 1) Load LHS and apply SiLU
+#                     lhs_val  = nl.load(lhs_tensor[gr, gc])
+#                     lhs_silu = nl.silu(lhs_val)
+
+#                     # 2) Load RHS
+#                     rhs_val  = nl.load(rhs_tensor[gr, gc])
+
+#                     # 3) Multiply, store in ephemeral tile
+#                     out_nl_tile[r, c] = nl.multiply(lhs_silu, rhs_val)
+
+#             # 5) Now copy ephemeral tile to final HBM output
+#             nl.store(out_tensor[start_h : start_h + TILE_H, start_w : start_w + TILE_W],
+#                      value=out_nl_tile)
+
+#     # 6) Return the final HBM tensor
+#     return out_tensor
 
 # @nki.jit
 # def nki_silu_mul(lhs_tensor, rhs_tensor):
@@ -376,8 +426,8 @@ def nki_silu_mul(lhs_tensor, rhs_tensor):
 #     return out_tensor
 
 def generate_2_matrices(device = xm.xla_device()):
-    x = torch.rand((1, 32, 4096), dtype=torch.bfloat16, device=device)
-    y = torch.rand((1, 32, 4096), dtype=torch.bfloat16, device=device)
+    x = torch.rand((1, 256, 4096), dtype=torch.bfloat16, device=device)
+    y = torch.rand((1, 256, 4096), dtype=torch.bfloat16, device=device)
     return x, y
 
 def main():
