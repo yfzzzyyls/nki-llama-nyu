@@ -41,6 +41,7 @@ from neuronx_distributed.parallel_layers.mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from neuronx_distributed.parallel_layers.utils import get_padding_length
+from neuronx_distributed.parallel_layers.parallel_state import get_kv_shared_group
 from neuronx_distributed.quantization.quantization_config import QuantizationType, QuantizedDtype
 from neuronx_distributed.quantization.quantization_layers import (  # noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402
     QuantizedColumnParallel,
@@ -60,15 +61,18 @@ from transformers import LlamaForCausalLM
 from transformers.activations import ACT2FN
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
 
+
 from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig  # noqa: E402
 from neuronx_distributed_inference.models.model_base import (  # noqa: E402
     NeuronBaseForCausalLM,
     NeuronBaseModel,
 )
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+from neuronx_distributed_inference.modules.attention.attention_base import FlashAttentionStrategy
 from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402
     BaseGroupQueryAttention,
 )
+from neuronx_distributed_inference.modules.attention.gqa import GQA
 from neuronx_distributed_inference.modules.attention.utils import (
     RotaryEmbedding,
     preprocess_quantized_linear_layer,
@@ -1476,7 +1480,9 @@ class NeuronLlamaAttention(NeuronAttentionBase):
     ) -> Tensor:
         """attention computation at token generation phase"""
         is_speculation = position_ids.shape[-1] > 1
+        
         print("USE SUBCLASS TOKEN GEN: is_spec is", is_speculation)
+
         # Attention computation: softmax((Q.K/√dkv) + mask).V
         # i. prior (cached) KV
         K_prior = past_key_value[0]
@@ -1507,6 +1513,101 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         attn_output = attn_prior + attn_active
 
         return attn_output
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        active_mask: Optional[torch.LongTensor] = None,
+        adapter_ids=None,
+        cos_cache: Optional[torch.Tensor] = None,
+        sin_cache: Optional[torch.Tensor] = None,
+        rmsnorm=None,
+    ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
+        """Implements each layer's forward pass for the attention block."""
+
+        print("USE SUBCLASS FORWARD")
+
+        bsz, q_len, _ = hidden_states.size()
+        if self.sequence_parallel_enabled:
+            q_len *= self.tensor_model_parallel_group.size()
+
+        Q, K, V, cos_cache, sin_cache = self.prep_qkv_tensors(
+            position_ids,
+            hidden_states,
+            past_key_value,
+            adapter_ids=adapter_ids,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            rmsnorm=rmsnorm,
+        )
+
+        flash_attn_strategy = FlashAttentionStrategy.NONE
+        if past_key_value is None:
+            attn_output, flash_attn_strategy = self.perform_prefill(
+                Q, K, V, q_len, bsz, attention_mask
+            )
+            if self.flash_decoding_enabled:
+                assert self.qkv_proj.sharding_strategy == GQA.REPLICATE_TO_TP_DEGREE, (
+                    "Flash decoding lives in the context of GQA (grouped query attention) and traditional MHA "
+                    "multi-head attention) won't work!"
+                )
+                rank_id = self.rank_util.get_rank()
+                rank_id_in_kv_group = torch.remainder(rank_id, self.num_cores_per_group).to(
+                    torch.int64
+                )
+                # shard KV by seq len and pick the values based on rank
+                assert q_len == Q.shape[2], f"Q shape is {Q.shape}"
+                # selecting positions (on S dim) that belongs to the current rank
+                offset = torch.arange(
+                    0, q_len, self.num_cores_per_group, dtype=torch.int64, device=Q.device
+                )
+                selected_seq_pos = offset + rank_id_in_kv_group
+                K = torch.index_select(input=K, dim=2, index=selected_seq_pos)
+                V = torch.index_select(input=V, dim=2, index=selected_seq_pos)
+        else:
+            if self.flash_decoding_enabled:
+                assert active_mask is not None, "Flash decoding requires active mask is not None!"
+                # gather Q from all cores in its KV group
+                groups = get_kv_shared_group(as_list=True)
+                Q = xm.all_gather(Q, dim=1, groups=groups, pin_layout=False)
+
+                attn_output = self.compute_for_flash_decoding(
+                    Q, K, V, past_key_value, attention_mask, active_mask
+                )
+                attn_output = xm.reduce_scatter(
+                    xm.REDUCE_SUM,
+                    attn_output,
+                    scale=1,
+                    scatter_dim=1,
+                    shard_count=len(groups[0]),
+                    groups=groups,
+                    pin_layout=False,
+                )
+            else:
+                attn_output = self.compute_for_token_gen(
+                    Q, K, V, position_ids, past_key_value, attention_mask, active_mask
+                )
+
+        if flash_attn_strategy != FlashAttentionStrategy.NONE:
+            # transpose BHDS -> BSHD
+            # this layout avoids additional transposes between attention kernel and output projection
+            attn_output = attn_output.permute(0, 3, 1, 2)
+        else:
+            # transpose BHSD -> BSHD
+            attn_output = attn_output.transpose(1, 2).contiguous()
+
+        # merge multi head hidden
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+
+        # Z = Z.Wo
+        attn_output = self.o_proj(attn_output, adapter_ids=adapter_ids)
+
+        past_key_value: Tuple[Tensor, Tensor] = (K, V)
+
+        return attn_output, past_key_value, cos_cache, sin_cache
 
 
 # TODO: Modularize RotaryEmbedding. See how HF transformers does it in 4.43.
