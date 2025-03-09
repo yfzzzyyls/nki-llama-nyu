@@ -529,6 +529,45 @@ def nki_matmul_fully_optimized_(
 
     return result
 
+def block_matmul(A, B, block_size=512, block_size_1=128):
+    """
+    分块矩阵乘法函数，适用于大矩阵乘法，使用 PyTorch 实现。
+
+    参数:
+    A (torch.Tensor): 第一个矩阵，形状为 [m, k]
+    B (torch.Tensor): 第二个矩阵，形状为 [k, n]
+    block_size (int): 分块大小，默认为 128
+
+    返回:
+    torch.Tensor: 结果矩阵，形状为 [m, n]
+    """
+    m, k = A.shape
+    k, n = B.shape
+    # original_dtype = A.dtype
+    # A = A.to(torch.float32)
+    # B = B.to(torch.float32)
+    # device = xm.xla_device()
+    # A = A.to(device)
+    # B = B.to(device)
+
+    # 初始化结果矩阵
+    result = torch.zeros((m, n), dtype = A.dtype, device=A.device)
+
+    # 分块计算矩阵乘法
+    for i in range(0, m, block_size_1):
+        for j in range(0, n, block_size):
+            for l in range(0, k, block_size_1):
+                # 获取当前块
+                A_block = A[i:i+block_size_1, l:l+block_size_1]
+                B_block = B[l:l+block_size_1, j:j+block_size]
+                m1, k1 = A_block.shape
+                k1, n1 = B_block.shape
+
+                # 计算当前块的乘积
+                result[i:i+block_size_1, j:j+block_size] += matmul_test(A_block.T, B_block, m1, n1)
+    # result = result.to(original_dtype)
+    return result
+
 @nki.jit
 def nki_silu_mul(lhs_tensor, rhs_tensor):
     """
@@ -1131,49 +1170,48 @@ class NeuronLlamaMLP(nn.Module):
             x = gather_from_sequence_parallel_region(
                 x, self.sequence_dimension, process_group=get_tp_group(self.config)
             )
-                
 
 ######################################################################################################################################################
 
-        # gate_proj_output = torch.matmul(x, self.gate_proj.weight.T)
-        # up_proj_output = torch.matmul(x, self.up_proj.weight.T)
+        gate_proj_output = torch.matmul(x, self.gate_proj.weight.T)
+        up_proj_output = torch.matmul(x, self.up_proj.weight.T)
 
-        B, N, C = x.shape   # For example, B * N = 32, C = 2048
-        M_orig = B * N      # Original M dimension (32)
+        # B, N, C = x.shape   # For example, B * N = 32, C = 2048
+        # M_orig = B * N      # Original M dimension (32)
 
-        # We need M to be a multiple of 256 = 128 x 2core.
-        BLOCK_M = 256
-        M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M  # Next multiple of 256
+        # # We need M to be a multiple of 256 = 128 x 2core.
+        # BLOCK_M = 256
+        # M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M  # Next multiple of 256
 
-        # Flatten x to 2D: [B*N, C]
-        x_flat_padded = x.view(M_orig, C) # was called x_flat
-        gate_weight_T = self.gate_proj.weight.T
-        up_weight_T = self.up_proj.weight.T
-        # Pad x_flat along dimension 0 if needed.
-        if M_pad > M_orig:
-            pad_rows = M_pad - M_orig
-            pad = torch.zeros(pad_rows, C, dtype=x.dtype, device=x.device)
-            x_flat_padded = torch.cat([x_flat_padded, pad], dim=0)
+        # # Flatten x to 2D: [B*N, C]
+        # x_flat_padded = x.view(M_orig, C) # was called x_flat
+        # gate_weight_T = self.gate_proj.weight.T
+        # up_weight_T = self.up_proj.weight.T
+        # # Pad x_flat along dimension 0 if needed.
+        # if M_pad > M_orig:
+        #     pad_rows = M_pad - M_orig
+        #     pad = torch.zeros(pad_rows, C, dtype=x.dtype, device=x.device)
+        #     x_flat_padded = torch.cat([x_flat_padded, pad], dim=0)
 
-        x_flat_padded_T = x_flat_padded.T
-        MDIM = x_flat_padded.shape[0]
-        NDIM = self.gate_proj.weight.shape[0]
-        KDIM = self.gate_proj.weight.shape[1]
+        # x_flat_padded_T = x_flat_padded.T
+        # MDIM = x_flat_padded.shape[0]
+        # NDIM = self.gate_proj.weight.shape[0]
+        # KDIM = self.gate_proj.weight.shape[1]
 
-        Mtile = MDIM // 128 // 2 ### 2 cores
-        Ntile = NDIM // 512
-        Ktile = KDIM // 128 
+        # Mtile = MDIM // 128 // 2 ### 2 cores
+        # Ntile = NDIM // 512
+        # Ktile = KDIM // 128 
 
-        # input transpose operation causes the biggest drop in latency
+        # # input transpose operation causes the biggest drop in latency
 
-        # output_padded = nki_matmul_fully_optimized_(x_flat_padded_T, gate_weight_T, Mtile, Ntile, Ktile)
-        output_padded = nki_matmul_fully_optimized_spmd_[nl.nc(2)](x_flat_padded_T, gate_weight_T, Mtile, Ntile, Ktile, 2)        
-        output_flat = output_padded[:M_orig, :]
-        gate_proj_output = output_flat.view(B, N, -1)
+        # # output_padded = nki_matmul_fully_optimized_(x_flat_padded_T, gate_weight_T, Mtile, Ntile, Ktile)
+        # output_padded = nki_matmul_fully_optimized_spmd_[nl.nc(2)](x_flat_padded_T, gate_weight_T, Mtile, Ntile, Ktile, 2)        
+        # output_flat = output_padded[:M_orig, :]
+        # gate_proj_output = output_flat.view(B, N, -1)
 
-        up_output_padded = nki_matmul_fully_optimized_spmd_[nl.nc(2)](x_flat_padded_T, up_weight_T, Mtile, Ntile, Ktile, 2)        
-        up_output_flat = up_output_padded[:M_orig, :]
-        up_proj_output = up_output_flat.view(B, N, -1)
+        # up_output_padded = nki_matmul_fully_optimized_spmd_[nl.nc(2)](x_flat_padded_T, up_weight_T, Mtile, Ntile, Ktile, 2)        
+        # up_output_flat = up_output_padded[:M_orig, :]
+        # up_proj_output = up_output_flat.view(B, N, -1)
 
 ######################################################################################################################################################
 
@@ -1291,7 +1329,6 @@ class NeuronLlamaMLP(nn.Module):
             if not is_lora_module(self.up_proj)
             else self.down_proj(down_proj_input, adapter_ids)
         )
-
         return output
 
     def forward(self, x, rmsnorm=None, residual=None, adapter_ids=None):
@@ -1408,22 +1445,28 @@ class NeuronLlamaAttention(NeuronAttentionBase):
                 # We include it here for compatibility with other scaling types.
                 self.rotary_emb = LlamaRotaryEmbedding(self.config)
 
-    # def scaled_qk(self, Q, K, attention_mask):
-    #     bs, head, sequence, dimension = Q.size()
-    #     _, head_k, sequence_k, dimension_k = K.size()
-    #     result = torch.zeros((bs, head, sequence, sequence_k), device = Q.device, dtype=Q.dtype)
+    def scaled_qk(self, Q, K, attention_mask):
+        ## 可以操作
+        ## [32,64] [64,32]
+        bs, head, sequence, dimension = Q.size()
+        _, head_k, sequence_k, dimension_k = K.size()
+        # print("size:", sequence)
+        # print("size2:", sequence_k)
+        result = torch.zeros((bs, head, sequence, sequence_k), device = Q.device, dtype=Q.dtype)
+        # print("Q.type:", Q.dtype)
+        for i in range(bs):
+            for j in range(head):
+                temp_q = Q[i, j, :, :]
+                temp_k = (K.transpose(2, 3))[i, j, :, :]
+                # print("temp_q", temp_q.size())
+                # print("temp_k", temp_k.size())
+                temp = block_matmul(temp_q, temp_k)
+                result[i, j, :, :] = temp
+        QK = result / math.sqrt(self.head_dim)
 
-    #     for i in range(bs):
-    #         for j in range(head):
-    #             temp_q = Q[i, j, :, :]
-    #             temp_k = (K.transpose(2, 3))[i, j, :, :]
-    #             temp = matmul_test(temp_q.T, temp_k, sequence, sequence_k)
-    #             # temp = matmul_test(temp_q.T, temp_k)
-    #             temp = temp / math.sqrt(self.head_dim)
-    #             result[i, j, :, :] = temp
-    #     QK = result
-    #     QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
-    #     return QK
+        # QK = torch.matmul(Q, K.transpose(2, 3)) / math.sqrt(self.head_dim)
+        QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
+        return QK
 
 # TODO: Modularize RotaryEmbedding. See how HF transformers does it in 4.43.
 class Llama3RotaryEmbedding(nn.Module):
@@ -1719,11 +1762,13 @@ class NeuronLlamaModel(NeuronBaseModel):
         self.medusa_speculation_length = config.neuron_config.medusa_speculation_length
 
         if self.is_medusa:
+            print("EVER is_medusa")
             if parallel_state.model_parallel_is_initialized():
                 medusa_head_cls = ColumnParallelLinear
             else:
                 medusa_head_cls = nn.Linear
             for i in range(self.num_medusa_heads):
+                print("EVER called ResBlock")
                 medusa_head = nn.Sequential(
                     *([ResBlock(config.hidden_size)] * 1),
                     medusa_head_cls(
