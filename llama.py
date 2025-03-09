@@ -100,11 +100,6 @@ SIMPLE_PROFILE = False
 
 _LLAMA_MODULE_MAP = {}
 
-
-
-
-
-
 ### attention base class
 
 import logging
@@ -1334,6 +1329,55 @@ def nki_matmul_fully_optimized_(
 
     return result
 
+@nki.jit
+def nki_silu_mul(lhs_tensor, rhs_tensor):
+    """
+    Tile-based SiLU + Multiply kernel, using nl.mgrid for 2D indexing.
+    """
+    # 1) Validate shape
+    H, W = lhs_tensor.shape
+    assert lhs_tensor.shape == rhs_tensor.shape, (
+        f"Shape mismatch: {lhs_tensor.shape} vs {rhs_tensor.shape}"
+    )
+    TILE_H = 128
+    TILE_W = 512
+    assert H % TILE_H == 0, f"H={H} not multiple of {TILE_H}"
+    assert W % TILE_W == 0, f"W={W} not multiple of {TILE_W}"
+
+    # 2) Allocate final output in HBM
+    out_tensor = nl.ndarray((H, W), dtype=lhs_tensor.dtype, buffer=nl.shared_hbm)
+
+    num_tiles_h = H // TILE_H
+    num_tiles_w = W // TILE_W
+
+    # 3) Loop over tiles
+    for tile_h_idx in nl.affine_range(num_tiles_h):
+        start_h = tile_h_idx * TILE_H
+
+        for tile_w_idx in nl.affine_range(num_tiles_w):
+            start_w = tile_w_idx * TILE_W
+
+            # Allocate a tile in ephemeral memory: shape (128, 512)
+            out_nl_tile = nl.zeros((TILE_H, TILE_W), dtype=lhs_tensor.dtype, buffer=nl.sbuf)
+
+            # 4) Use nl.mgrid to index over [0..TILE_H) x [0..TILE_W)
+            #    .p is the first dimension, .x is the second dimension
+            i_rc = nl.mgrid[0:TILE_H, 0:TILE_W]
+
+            lhs_val  = nl.load(lhs_tensor[start_h + i_rc.p, start_w + i_rc.x])
+            lhs_silu = nl.silu(lhs_val)
+            rhs_val  = nl.load(rhs_tensor[start_h + i_rc.p, start_w + i_rc.x])
+
+            # Store elementwise multiplication in the ephemeral tile
+            out_nl_tile[i_rc.p, i_rc.x] = nl.multiply(lhs_silu, rhs_val)
+
+            # 5) Store ephemeral tile to final HBM output
+            nl.store(
+                out_tensor[start_h : start_h + TILE_H, start_w : start_w + TILE_W],
+                value=out_nl_tile
+            )
+
+    return out_tensor
 
 @nki.jit
 def nki_rmsnorm_kernel(a_tensor, g_tensor, eps):
@@ -1941,9 +1985,57 @@ class NeuronLlamaMLP(nn.Module):
 
         gate_proj_output = torch.matmul(x, self.gate_proj.weight.T)
         up_proj_output = torch.matmul(x, self.up_proj.weight.T)
-        
-        
-        down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
+        # gate_proj_output = (
+        #     self.gate_proj(x)
+        #     if not is_lora_module(self.gate_proj)
+        #     else self.gate_proj(x, adapter_ids)
+        # )
+        # up_proj_output = (
+        #     self.up_proj(x) if not is_lora_module(self.up_proj) else self.up_proj(x, adapter_ids)
+        # )
+        ################################################################################################################################
+        # down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
+
+        # 1) Get their shapes
+        B1, L1, E1 = gate_proj_output.shape
+        B2, L2, E2 = up_proj_output.shape
+
+        # 2) (Optional) Assert shapes match
+        assert B1 == B2, f"B mismatch: {B1} != {B2}"
+        assert L1 == L2, f"L mismatch: {L1} != {L2}"
+        assert E1 == E2, f"E mismatch: {E1} != {E2}"
+
+        # 3) Flatten each from 3D -> 2D
+        lhs_2d = gate_proj_output.view(B1 * L1, E1)
+        rhs_2d = up_proj_output.view(B2 * L2, E2)
+
+        M_orig = B1 * L1      # Original M dimension (32)
+
+        # We need M to be a multiple of 256 = 128 x 2core.
+        BLOCK_M = 128
+        M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M  # Next multiple of 128/256
+
+        if M_pad > M_orig:
+            pad_rows = M_pad - M_orig
+            pad = torch.zeros(pad_rows, E1, dtype=gate_proj_output.dtype, device=gate_proj_output.device)
+            lhs_2d_padded = torch.cat([lhs_2d, pad], dim=0)
+            rhs_2d_padded = torch.cat([rhs_2d, pad], dim=0)
+        else:
+            lhs_2d_padded = lhs_2d
+            rhs_2d_padded = rhs_2d
+
+        # 4) Run the NKI SiLU + multiply kernel on 2D
+        nki_actfn_output_2d_padded = nki_silu_mul(lhs_2d_padded, rhs_2d_padded)
+        if M_pad > M_orig:
+            nki_actfn_output_2d = nki_actfn_output_2d_padded[:M_orig, :]
+        else:
+            nki_actfn_output_2d = nki_actfn_output_2d_padded
+
+        # 5) Un-flatten back to 3D
+        down_proj_input = nki_actfn_output_2d.view(B1, L1, E1)
+
+        ################################################################################################################################
+
         output = (
             self.down_proj(down_proj_input)
             if not is_lora_module(self.up_proj)
