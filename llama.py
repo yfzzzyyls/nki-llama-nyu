@@ -530,6 +530,56 @@ def nki_matmul_fully_optimized_(
     return result
 
 @nki.jit
+def nki_silu_mul(lhs_tensor, rhs_tensor):
+    """
+    Tile-based SiLU + Multiply kernel, using nl.mgrid for 2D indexing.
+    """
+    # 1) Validate shape
+    H, W = lhs_tensor.shape
+    assert lhs_tensor.shape == rhs_tensor.shape, (
+        f"Shape mismatch: {lhs_tensor.shape} vs {rhs_tensor.shape}"
+    )
+    TILE_H = 128
+    TILE_W = 512
+    assert H % TILE_H == 0, f"H={H} not multiple of {TILE_H}"
+    assert W % TILE_W == 0, f"W={W} not multiple of {TILE_W}"
+
+    # 2) Allocate final output in HBM
+    out_tensor = nl.ndarray((H, W), dtype=lhs_tensor.dtype, buffer=nl.shared_hbm)
+
+    num_tiles_h = H // TILE_H
+    num_tiles_w = W // TILE_W
+
+    # 3) Loop over tiles
+    for tile_h_idx in nl.affine_range(num_tiles_h):
+        start_h = tile_h_idx * TILE_H
+
+        for tile_w_idx in nl.affine_range(num_tiles_w):
+            start_w = tile_w_idx * TILE_W
+
+            # Allocate a tile in ephemeral memory: shape (128, 512)
+            out_nl_tile = nl.zeros((TILE_H, TILE_W), dtype=lhs_tensor.dtype, buffer=nl.sbuf)
+
+            # 4) Use nl.mgrid to index over [0..TILE_H) x [0..TILE_W)
+            #    .p is the first dimension, .x is the second dimension
+            i_rc = nl.mgrid[0:TILE_H, 0:TILE_W]
+
+            lhs_val  = nl.load(lhs_tensor[start_h + i_rc.p, start_w + i_rc.x])
+            lhs_silu = nl.silu(lhs_val)
+            rhs_val  = nl.load(rhs_tensor[start_h + i_rc.p, start_w + i_rc.x])
+
+            # Store elementwise multiplication in the ephemeral tile
+            out_nl_tile[i_rc.p, i_rc.x] = nl.multiply(lhs_silu, rhs_val)
+
+            # 5) Store ephemeral tile to final HBM output
+            nl.store(
+                out_tensor[start_h : start_h + TILE_H, start_w : start_w + TILE_W],
+                value=out_nl_tile
+            )
+
+    return out_tensor
+
+@nki.jit
 def nki_rmsnorm_kernel(a_tensor, g_tensor, eps):
     # Calculate out_tensor = a_tensor/RMS(a_tensor) * g_tensor
     # Where RMS(a_tensor) = sqrt((1/N) * sum(a_tensor * a_tensor))
@@ -1085,117 +1135,153 @@ class NeuronLlamaMLP(nn.Module):
 
 ######################################################################################################################################################
 
-        # B, N, C = x.shape   # For example, B * N = 32, C = 2048
-        # M_orig = B * N      # Original M dimension (32)
+        # gate_proj_output = torch.matmul(x, self.gate_proj.weight.T)
+        # up_proj_output = torch.matmul(x, self.up_proj.weight.T)
 
-        # # We need M to be a multiple of 256 = 128 x 2core.
-        # BLOCK_M = 256
-        # M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M  # Next multiple of 256
+        B, N, C = x.shape   # For example, B * N = 32, C = 2048
+        M_orig = B * N      # Original M dimension (32)
 
-        # # Flatten x to 2D: [B*N, C]
-        # x_flat_padded = x.view(M_orig, C) # was called x_flat
-        # gate_weight_T = self.gate_proj.weight.T
+        # We need M to be a multiple of 256 = 128 x 2core.
+        BLOCK_M = 256
+        M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M  # Next multiple of 256
 
-        # # Pad x_flat along dimension 0 if needed.
-        # if M_pad > M_orig:
-        #     pad_rows = M_pad - M_orig
-        #     pad = torch.zeros(pad_rows, C, dtype=x.dtype, device=x.device)
-        #     x_flat_padded = torch.cat([x_flat_padded, pad], dim=0)
-
-        # x_flat_padded_T = x_flat_padded.T
-        # MDIM = x_flat_padded.shape[0]
-        # NDIM = self.gate_proj.weight.shape[0]
-        # KDIM = self.gate_proj.weight.shape[1]
-
-        # Mtile = MDIM // 128 // 2 ### 2 cores
-        # Ntile = NDIM // 512
-        # Ktile = KDIM // 128 
-
-        # # input transpose operation causes the biggest drop in latency
-
-        # # output_padded = nki_matmul_fully_optimized_(x_flat_padded_T, gate_weight_T, Mtile, Ntile, Ktile)
-        # output_padded = nki_matmul_fully_optimized_spmd_[nl.nc(2)](x_flat_padded_T, gate_weight_T, Mtile, Ntile, Ktile, 2)        
-        # output_flat = output_padded[:M_orig, :]
-        # gate_proj_output = output_flat.view(B, N, -1)
-        # # gate_proj_output = torch.matmul(x, self.gate_proj.weight.T)
-
-
-        # # up_proj_output = torch.matmul(x, self.up_proj.weight.T)
-        # up_weight_T = self.up_proj.weight.T
-        # up_output_padded = nki_matmul_fully_optimized_spmd_[nl.nc(2)](x_flat_padded_T, up_weight_T, Mtile, Ntile, Ktile, 2)        
-        # up_output_flat = up_output_padded[:M_orig, :]
-        # up_proj_output = up_output_flat.view(B, N, -1)
-
-######################################################################################################################################################
-
-        gate_weight = self.gate_proj.weight.T
-        up_weight = self.up_proj.weight.T
-
-        BLOCK_M = 256        # or whatever multiple of 128 * #cores you use
-
-        B, N_, C = x.shape
-        M_orig = B * N_          # e.g. 32 in your example
-
-        # We need M to be multiple of 256=128x2 for 2-core parallel
-        M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M
-
-        # Flatten x to [M_orig, C]
-        x_flat = x.view(M_orig, C)
-
+        # Flatten x to 2D: [B*N, C]
+        x_flat_padded = x.view(M_orig, C) # was called x_flat
+        gate_weight_T = self.gate_proj.weight.T
+        up_weight_T = self.up_proj.weight.T
+        # Pad x_flat along dimension 0 if needed.
         if M_pad > M_orig:
             pad_rows = M_pad - M_orig
             pad = torch.zeros(pad_rows, C, dtype=x.dtype, device=x.device)
-            x_flat_padded = torch.cat([x_flat, pad], dim=0)
-        else:
-            x_flat_padded = x_flat
+            x_flat_padded = torch.cat([x_flat_padded, pad], dim=0)
 
-        # Transpose to match kernel’s shape (K= C, M= M_pad)
-        x_flat_padded_T = x_flat_padded.T  # shape (C, M_pad)
+        x_flat_padded_T = x_flat_padded.T
+        MDIM = x_flat_padded.shape[0]
+        NDIM = self.gate_proj.weight.shape[0]
+        KDIM = self.gate_proj.weight.shape[1]
 
-        # -- Horizontally concat gate & up weight: shape (C, out1 + out2)
-        combined_weight = torch.cat([gate_weight, up_weight], dim=1)
-        out1 = gate_weight.shape[1]
-        out2 = up_weight.shape[1]
-        assert combined_weight.shape == (C, out1 + out2)
-
-        # Decide tiling parameters exactly as you do now
-        MDIM = x_flat_padded.shape[0]    # = M_pad
-        KDIM = C                         # same as kernel "K"
-        NDIM = out1 + out2              # total columns
-
-        # e.g. for 2 cores, tile M dim in multiples of 128, etc.
-        Mtile = MDIM // 128 // 2
+        Mtile = MDIM // 128 // 2 ### 2 cores
         Ntile = NDIM // 512
-        Ktile = KDIM // 128
+        Ktile = KDIM // 128 
 
-        # -- Single kernel call for both gate & up
-        big_output_padded = nki_matmul_fully_optimized_spmd_proj_fused[
-            nl.nc(2)
-        ](
-            x_flat_padded_T,    # shape (C, M_pad) => (K, M)
-            combined_weight,  # shape (C, out1+out2) => (K, N)
-            Mtile,
-            Ntile,
-            Ktile,
-            2    # spmd_m=2
-        )
+        # input transpose operation causes the biggest drop in latency
 
-        # big_output_padded has shape (M_pad, out1+out2)
-        # Slice off the padding, if any
-        big_output_flat = big_output_padded[:M_orig, :]  # (M_orig, out1+out2)
+        # output_padded = nki_matmul_fully_optimized_(x_flat_padded_T, gate_weight_T, Mtile, Ntile, Ktile)
+        output_padded = nki_matmul_fully_optimized_spmd_[nl.nc(2)](x_flat_padded_T, gate_weight_T, Mtile, Ntile, Ktile, 2)        
+        output_flat = output_padded[:M_orig, :]
+        gate_proj_output = output_flat.view(B, N, -1)
 
-        # Split columns
-        gate_output_flat = big_output_flat[:, :out1]      # (M_orig, out1)
-        up_output_flat   = big_output_flat[:, out1:]      # (M_orig, out2)
-
-        # Reshape back to [B, N_, ...]
-        gate_proj_output = gate_output_flat.view(B, N_, out1)
-        up_proj_output   = up_output_flat.view(B, N_, out2)
+        up_output_padded = nki_matmul_fully_optimized_spmd_[nl.nc(2)](x_flat_padded_T, up_weight_T, Mtile, Ntile, Ktile, 2)        
+        up_output_flat = up_output_padded[:M_orig, :]
+        up_proj_output = up_output_flat.view(B, N, -1)
 
 ######################################################################################################################################################
 
-        down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
-        # print("Down proj input shape: ", down_proj_input.size()) # 1 x [128, 256, 640] x 4096
+        # gate_weight = self.gate_proj.weight.T
+        # up_weight = self.up_proj.weight.T
+
+        # BLOCK_M = 256        # or whatever multiple of 128 * #cores you use
+
+        # B, N_, C = x.shape
+        # M_orig = B * N_          # e.g. 32 in your example
+
+        # # We need M to be multiple of 256=128x2 for 2-core parallel
+        # M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M
+
+        # # Flatten x to [M_orig, C]
+        # x_flat = x.view(M_orig, C)
+
+        # if M_pad > M_orig:
+        #     pad_rows = M_pad - M_orig
+        #     pad = torch.zeros(pad_rows, C, dtype=x.dtype, device=x.device)
+        #     x_flat_padded = torch.cat([x_flat, pad], dim=0)
+        # else:
+        #     x_flat_padded = x_flat
+
+        # # Transpose to match kernel’s shape (K= C, M= M_pad)
+        # x_flat_padded_T = x_flat_padded.T  # shape (C, M_pad)
+
+        # # -- Horizontally concat gate & up weight: shape (C, out1 + out2)
+        # combined_weight = torch.cat([gate_weight, up_weight], dim=1)
+        # out1 = gate_weight.shape[1]
+        # out2 = up_weight.shape[1]
+        # assert combined_weight.shape == (C, out1 + out2)
+
+        # # Decide tiling parameters exactly as you do now
+        # MDIM = x_flat_padded.shape[0]    # = M_pad
+        # KDIM = C                         # same as kernel "K"
+        # NDIM = out1 + out2              # total columns
+
+        # # e.g. for 2 cores, tile M dim in multiples of 128, etc.
+        # Mtile = MDIM // 128 // 2
+        # Ntile = NDIM // 512
+        # Ktile = KDIM // 128
+
+        # # -- Single kernel call for both gate & up
+        # big_output_padded = nki_matmul_fully_optimized_spmd_proj_fused[
+        #     nl.nc(2)
+        # ](
+        #     x_flat_padded_T,    # shape (C, M_pad) => (K, M)
+        #     combined_weight,  # shape (C, out1+out2) => (K, N)
+        #     Mtile,
+        #     Ntile,
+        #     Ktile,
+        #     2    # spmd_m=2
+        # )
+
+        # # big_output_padded has shape (M_pad, out1+out2)
+        # # Slice off the padding, if any
+        # big_output_flat = big_output_padded[:M_orig, :]  # (M_orig, out1+out2)
+
+        # # Split columns
+        # gate_output_flat = big_output_flat[:, :out1]      # (M_orig, out1)
+        # up_output_flat   = big_output_flat[:, out1:]      # (M_orig, out2)
+
+        # # Reshape back to [B, N_, ...]
+        # gate_proj_output = gate_output_flat.view(B, N_, out1)
+        # up_proj_output   = up_output_flat.view(B, N_, out2)
+
+######################################################################################################################################################
+
+        # 1) Get their shapes
+        B1, L1, E1 = gate_proj_output.shape
+        B2, L2, E2 = up_proj_output.shape
+
+        # 2) (Optional) Assert shapes match
+        assert B1 == B2, f"B mismatch: {B1} != {B2}"
+        assert L1 == L2, f"L mismatch: {L1} != {L2}"
+        assert E1 == E2, f"E mismatch: {E1} != {E2}"
+
+        # 3) Flatten each from 3D -> 2D
+        lhs_2d = gate_proj_output.view(B1 * L1, E1)
+        rhs_2d = up_proj_output.view(B2 * L2, E2)
+
+        _M_orig = B1 * L1      # Original M dimension (32)
+
+        # We need M to be a multiple of 256 = 128 x 2core.
+        _BLOCK_M = 128
+        _M_pad = math.ceil(_M_orig / _BLOCK_M) * _BLOCK_M  # Next multiple of 128/256
+
+        if _M_pad > _M_orig:
+            pad_rows = _M_pad - _M_orig
+            pad = torch.zeros(pad_rows, E1, dtype=gate_proj_output.dtype, device=gate_proj_output.device)
+            lhs_2d_padded = torch.cat([lhs_2d, pad], dim=0)
+            rhs_2d_padded = torch.cat([rhs_2d, pad], dim=0)
+        else:
+            lhs_2d_padded = lhs_2d
+            rhs_2d_padded = rhs_2d
+
+        # 4) Run the NKI SiLU + multiply kernel on 2D
+        nki_actfn_output_2d_padded = nki_silu_mul(lhs_2d_padded, rhs_2d_padded)
+        if _M_pad > _M_orig:
+            nki_actfn_output_2d = nki_actfn_output_2d_padded[:_M_orig, :]
+        else:
+            nki_actfn_output_2d = nki_actfn_output_2d_padded
+
+        # 5) Un-flatten back to 3D
+        down_proj_input = nki_actfn_output_2d.view(B1, L1, E1)
+
+        # down_proj_input = self.act_fn(gate_proj_output) * up_proj_output
 
 ###################################################################################################################################################### 
         
