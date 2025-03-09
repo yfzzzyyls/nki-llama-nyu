@@ -1,8 +1,70 @@
+import copy
+import sys
+import gc
+import logging
+import math
+import numpy as np
+import time
+from typing import List, Optional, Tuple, Type
+
 import torch
-from neuronxcc import nki
+from neuronx_distributed.parallel_layers import parallel_state  # noqa: E402
+from neuronx_distributed.parallel_layers.layers import (  # noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402
+    ColumnParallelLinear,
+    ParallelEmbedding,
+    RowParallelLinear,
+)
+from neuronx_distributed.parallel_layers.mappings import (
+    gather_from_sequence_parallel_region,
+    reduce_from_tensor_model_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+)
+from neuronx_distributed.parallel_layers.utils import get_padding_length
+from neuronx_distributed.quantization.quantization_config import QuantizationType, QuantizedDtype
+from neuronx_distributed.quantization.quantization_layers import (  # noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402
+    QuantizedColumnParallel,
+    QuantizedRowParallel,
+)
+from neuronxcc.nki._private_kernels.mlp import (
+    mlp_fused_add_isa_kernel,
+    mlp_isa_kernel,
+    quant_mlp_fused_add_isa_kernel,
+    quant_mlp_isa_kernel,
+)
+from neuronxcc.nki._private_kernels.rmsnorm import rmsnorm_quant_isa_kernel
+from neuronxcc.starfish.penguin.targets.nki.private_api import vnc
+from torch import nn, ones
+from torch_neuronx.xla_impl.ops import nki_jit
+from transformers import LlamaForCausalLM
+from transformers.activations import ACT2FN
+from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
+
+from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig  # noqa: E402
+from neuronx_distributed_inference.models.model_base import (  # noqa: E402
+    NeuronBaseForCausalLM,
+    NeuronBaseModel,
+)
+from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+from neuronx_distributed_inference.modules.attention.gqa import (  # noqa: E402
+    BaseGroupQueryAttention,
+)
+from neuronx_distributed_inference.modules.attention.utils import (
+    RotaryEmbedding,
+    preprocess_quantized_linear_layer,
+    transpose_parallel_linear_layer,
+)
+
+# from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
+from neuronx_distributed_inference.modules.flashdecode.utils import calculate_num_cores_per_group
+from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
+from neuronx_distributed_inference.utils.distributed import get_tp_group
+
+from torch_neuronx.xla_impl.ops import RmsNorm
+
+import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as nisa
-import math
+
 import os
 from torch_xla.core import xla_model as xm
 
@@ -112,78 +174,6 @@ def nki_matmul_fully_optimized_(
 
     return result
 
-@nki.jit
-def nki_matmul_block_free_dimension_(lhsT, rhs):
-    # print("K dim, k_ dim", lhsT.shape, rhs.shape)
-
-    K, M = lhsT.shape
-    K_, N = rhs.shape
-  
-    assert K == K_, "lhsT and rhs must have the same contraction dimension"
-    result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
-
-    TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-    TILE_K = nl.tile_size.pmax  # 128
-    TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-
-    # Define the indices (shape) of the tiles
-    i_lhsT = nl.mgrid[0:TILE_K, 0:TILE_M]
-    i_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
-    i_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-
-    # Configuring the blocking size for the free dimensions
-    TILES_IN_BLOCK_M = 2
-    TILES_IN_BLOCK_N = 2
-
-    BLOCK_M = TILE_M * TILES_IN_BLOCK_M  # 256
-    BLOCK_N = TILE_N * TILES_IN_BLOCK_N  # 1024
-
-    # the size has to be multiple of block size
-    assert M % BLOCK_M == 0
-    assert N % BLOCK_N == 0
-
-    # Loop over blocks over the M dimension
-    for m in nl.affine_range(M // BLOCK_M):
-        # Load TILES_IN_BLOCK_M columns tiles from lhsT
-        lhsT_tiles = nl.ndarray(
-            (TILES_IN_BLOCK_M, K // TILE_K, nl.par_dim(TILE_K), TILE_M),
-            dtype=lhsT.dtype,
-            buffer=nl.sbuf)
-        for bm in nl.affine_range(TILES_IN_BLOCK_M):
-            for k in nl.affine_range(K // TILE_K):
-                lhsT_tiles[bm, k, i_lhsT.p, i_lhsT.x] = nl.load(
-                    lhsT[k * TILE_K + i_lhsT.p,
-                        (m * TILES_IN_BLOCK_M + bm) * TILE_M + i_lhsT.x])
-
-        for n in nl.affine_range(N // BLOCK_N):
-            # Load TILES_IN_BLOCK_N columns from rhs
-            rhs_tiles = nl.ndarray(
-                (TILES_IN_BLOCK_N, K // TILE_K, nl.par_dim(TILE_K), TILE_N),
-                dtype=rhs.dtype,
-                buffer=nl.sbuf)
-            for bn in nl.affine_range(TILES_IN_BLOCK_N):
-                for k in nl.affine_range(K // TILE_K):
-                    rhs_tiles[bn, k, i_rhs.p, i_rhs.x] = nl.load(
-                        rhs[k * TILE_K + i_rhs.p,
-                            (n * TILES_IN_BLOCK_N + bn) * TILE_N + i_rhs.x])
-
-            for bm in nl.affine_range(TILES_IN_BLOCK_M):
-                for bn in nl.affine_range(TILES_IN_BLOCK_N):
-                # Allocate a tensor in PSUM
-                    res_psum = nl.zeros((TILE_M, TILE_N), nl.float32, buffer=nl.psum)
-                    for k in nl.affine_range(K // TILE_K):
-                        # Accumulate partial-sums into PSUM
-                        res_psum += nl.matmul(lhsT_tiles[bm, k, i_lhsT.p, i_lhsT.x],
-                                            rhs_tiles[bn, k, i_rhs.p, i_rhs.x],
-                                            transpose_x=True)
-
-                    # Copy the result from PSUM back to SBUF, and cast to expected output data-type
-                    res_sb = nl.copy(res_psum, dtype=result.dtype)
-                    nl.store(result[(m * TILES_IN_BLOCK_M + bm) * TILE_M + i_res.p,
-                                    (n * TILES_IN_BLOCK_N + bn) * TILE_N + i_res.x],
-                            value=res_sb)
-
-    return result
 
 @nki.jit
 def nki_matmul(lshT, rsh, mdim, cdim, ndim):
@@ -231,102 +221,139 @@ def test_matmul_singletile(device = xm.xla_device()):
     print(f"matmul_output_shape={output.shape}") # supposed to be 2048x4096
     return output, a_tensor, b_tensor
 
-
-def test_block_free(device = xm.xla_device()):
-    # lshT: input
-    x = torch.rand((1, 32, 2048), dtype=torch.bfloat16, device=device)
-
-    # rsh: weight
-    weight = torch.rand((8192, 2048), dtype=torch.bfloat16, device=device)
-
-    B, N, C = x.shape   # For example, B * N = 32, C = 2048
-    M_orig = B * N      # Original M dimension (32)
-
-    # We need M to be a multiple of 128.
-    BLOCK_M = 256
-    M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M  # Next multiple of 128
-
-    # Flatten x to 2D: [B*N, C]
-    x_flat = x.view(M_orig, C)
-
-    # Pad x_flat along dimension 0 if needed.
-    if M_pad > M_orig:
-        pad_rows = M_pad - M_orig
-        pad = torch.zeros(pad_rows, C, dtype=x.dtype, device=x.device)
-        x_flat_padded = torch.cat([x_flat, pad], dim=0)
-    else:
-        x_flat_padded = x_flat
-
-    print("input padded shape", x_flat_padded.T.size())
-    print("weight transpose shape", weight.T.size())        
-    output_padded = nki_matmul_block_free_dimension_(x_flat_padded, weight.T)
-    output_flat = output_padded[:M_orig, :]
-    gate_proj_output = output_flat.view(B, N, -1)
-
-    print(f"matmul_output_shape={gate_proj_output.shape}") # supposed to be 2048x4096
-    print(f"matmul_output_type={gate_proj_output.type}")
-
-    return gate_proj_output, x, weight.T
-
-def test_fully_optimized_matmul(device = xm.xla_device()):
-    # lshT: input
-    x = torch.rand((1, 32, 2048), dtype=torch.bfloat16, device=device)
-
-    # rsh: weight
-    weight = torch.rand((8192, 2048), dtype=torch.bfloat16, device=device)
-
-    B, N, C = x.shape   # For example, B * N = 32, C = 2048
-    M_orig = B * N      # Original M dimension (32)
-
-    # We need M to be a multiple of 128.
-    BLOCK_M = 256
-    M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M  # Next multiple of 128
-
-    # Flatten x to 2D: [B*N, C]
-    x_flat = x.view(M_orig, C)
-
-    # Pad x_flat along dimension 0 if needed.
-    if M_pad > M_orig:
-        pad_rows = M_pad - M_orig
-        pad = torch.zeros(pad_rows, C, dtype=x.dtype, device=x.device)
-        x_flat_padded = torch.cat([x_flat, pad], dim=0)
-    else:
-        x_flat_padded = x_flat
-
-    print("input padded shape", x_flat_padded.T.size())
-    print("weight transpose shape", weight.T.size())        
-    output_padded = nki_matmul_fully_optimized_(x_flat_padded.T, weight.T)
-    output_flat = output_padded[:M_orig, :]
-    gate_proj_output = output_flat.view(B, N, -1)
-
-    print(f"fully_optimized_output_shape={gate_proj_output.shape}") # supposed to be 2048x4096
-
-    return gate_proj_output, x, weight.T
-
-def check_match(lsh, rsh, nki_output):
+def check_2matrices_match(default_output, nki_output):
     cpu = torch.device('cpu')
     nki_output_cpu = nki_output.to(device=cpu)
-     
-    # Compute the expected result using torch.matmul (or any other reference method)
-    torch_output = torch.matmul(lsh, rsh)
 
     # Ensure both outputs are on the same device (if necessary, move to CPU)
-    torch_output_cpu = torch_output.cpu()
-    print(f"torch_matmul_output_shape={torch_output.shape}") # supposed to be 2048x4096
-    print(f"torch_matmul_output_type={torch_output.type}") # supposed to be 2048x4096
+    default_output_cpu = default_output.cpu()
 
     # Compare using torch.allclose with a tolerance (adjust atol/rtol as needed)
-    if torch.allclose(torch_output_cpu, nki_output_cpu, atol=1e-5):
+    if torch.allclose(default_output_cpu, nki_output_cpu, atol=1e-2):
         print("The results match!")
     else:
         print("There is a mismatch between the outputs.")
 
+def get_actfn(actfn_str):
+    actfn = ACT2FN[actfn_str]
+    return actfn
+
+def test_nki_silu_mul(device = xm.xla_device()):
+    # Generate two random 3D tensors of shape (B, L, E)
+    lhs, rhs = generate_2_matrices(device)  # e.g. (1, 32, 4096)
+
+    B1, L1, E1 = lhs.shape
+    B2, L2, E2 = rhs.shape
+
+    # 2) (Optional) Assert shapes match
+    assert B1 == B2, f"B mismatch: {B1} != {B2}"
+    assert L1 == L2, f"L mismatch: {L1} != {L2}"
+    assert E1 == E2, f"E mismatch: {E1} != {E2}"
+
+    # 3) Flatten each from 3D -> 2D
+    lhs_2d = lhs.view(B1 * L1, E1)
+    rhs_2d = rhs.view(B2 * L2, E2)
+
+    M_orig = B1 * L1      # Original M dimension (32)
+
+    # We need M to be a multiple of 256 = 128 x 2core.
+    BLOCK_M = 128
+    M_pad = math.ceil(M_orig / BLOCK_M) * BLOCK_M  # Next multiple of 256
+
+    if M_pad > M_orig:
+        pad_rows = M_pad - M_orig
+        pad = torch.zeros(pad_rows, E1, dtype=lhs.dtype, device=lhs.device)
+        lhs_2d_padded = torch.cat([lhs_2d, pad], dim=0)
+        rhs_2d_padded = torch.cat([rhs_2d, pad], dim=0)
+    else:
+        lhs_2d_padded = lhs_2d
+        rhs_2d_padded = rhs_2d
+
+    # 4) Run the NKI SiLU + multiply kernel on 2D
+    nki_actfn_output_2d_padded = nki_silu_mul(lhs_2d_padded, rhs_2d_padded)
+    if M_pad > M_orig:
+        nki_actfn_output_2d = nki_actfn_output_2d_padded[:M_orig, :]
+    else:
+        nki_actfn_output_2d = nki_actfn_output_2d_padded
+
+    # 5) Un-flatten back to 3D
+    nki_actfn_output_3d = nki_actfn_output_2d.view(B1, L1, E1)
+
+    # 6) For reference, compute the default PyTorch-based result in 3D
+    default_actfn = get_actfn("silu")  # e.g. F.silu
+    default_actfn_output_3d = default_actfn(lhs) * rhs
+
+    # 7) Compare the two outputs
+    check_2matrices_match(default_actfn_output_3d, nki_actfn_output_3d)
+
+@nki.jit
+def nki_silu_mul(lhs_tensor, rhs_tensor):
+    """
+    Tile-based SiLU + Multiply kernel, using nl.mgrid for 2D indexing.
+    """
+    # 1) Validate shape
+    H, W = lhs_tensor.shape
+    assert lhs_tensor.shape == rhs_tensor.shape, (
+        f"Shape mismatch: {lhs_tensor.shape} vs {rhs_tensor.shape}"
+    )
+    TILE_H = 128
+    TILE_W = 512
+    assert H % TILE_H == 0, f"H={H} not multiple of {TILE_H}"
+    assert W % TILE_W == 0, f"W={W} not multiple of {TILE_W}"
+
+    # 2) Allocate final output in HBM
+    out_tensor = nl.ndarray((H, W), dtype=lhs_tensor.dtype, buffer=nl.shared_hbm)
+
+    num_tiles_h = H // TILE_H
+    num_tiles_w = W // TILE_W
+
+    # 3) Loop over tiles
+    for tile_h_idx in nl.affine_range(num_tiles_h):
+        start_h = tile_h_idx * TILE_H
+
+        for tile_w_idx in nl.affine_range(num_tiles_w):
+            start_w = tile_w_idx * TILE_W
+
+            # Allocate a tile in ephemeral memory: shape (128, 512)
+            out_nl_tile = nl.zeros((TILE_H, TILE_W), dtype=lhs_tensor.dtype, buffer=nl.sbuf)
+
+            # 4) Use nl.mgrid to index over [0..TILE_H) x [0..TILE_W)
+            #    .p is the first dimension, .x is the second dimension
+            i_rc = nl.mgrid[0:TILE_H, 0:TILE_W]
+
+            lhs_val  = nl.load(lhs_tensor[start_h + i_rc.p, start_w + i_rc.x])
+            lhs_silu = nl.silu(lhs_val)
+            rhs_val  = nl.load(rhs_tensor[start_h + i_rc.p, start_w + i_rc.x])
+
+            # Store elementwise multiplication in the ephemeral tile
+            out_nl_tile[i_rc.p, i_rc.x] = nl.multiply(lhs_silu, rhs_val)
+
+            # 5) Store ephemeral tile to final HBM output
+            nl.store(
+                out_tensor[start_h : start_h + TILE_H, start_w : start_w + TILE_W],
+                value=out_nl_tile
+            )
+
+    return out_tensor
+
+def generate_2_matrices(device = xm.xla_device()):
+    x = torch.rand((1, 256, 4096), dtype=torch.bfloat16, device=device)
+    y = torch.rand((1, 256, 4096), dtype=torch.bfloat16, device=device)
+    return x, y
+
 def main():
-    # device = xm.xla_device() # device name
+    # use Trn1 instance
+    device = xm.xla_device()
+    # # test SPMD matmul
+    # nki_output = test_mlp_gating_fully_optimized_matmul(device)
+
+    # test nki activation fucntion
+    test_nki_silu_mul(device)
+
     # nki_output, lsh, rsh = test_matmul_singletile()
-    nki_output, lsh, rsh = test_fully_optimized_matmul()
     # nki_output, lsh, rsh = test_block_free()
-    check_match(lsh, rsh, nki_output)
+    # check_match(lsh, rsh, nki_output)
+    # performance_test()
 
 if __name__ == "__main__":
     main()
