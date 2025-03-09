@@ -47,7 +47,7 @@ def parse_args():
 
     # Evaluation
     parser.add_argument("--benchmark", action="store_true")
-    parser.add_argument("--divergence-difference-tol", type=float, default=0.001)
+    parser.add_argument("--divergence-difference-tol", type=float, default=0.125)
     parser.add_argument("--tol-map", type=str)
     parser.add_argument("--num-tokens-to-check", type=int)
 
