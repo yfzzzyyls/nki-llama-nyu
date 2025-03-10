@@ -700,14 +700,12 @@ class CustomRMSNorm(nn.Module):
         self.nki_enabled = nki_enabled
 
     def forward(self, hidden_states):
-        if self.nki_enabled:
-            out_tensor = nki_rmsnorm_kernel(hidden_states, self.weight, self.variance_epsilon)
-            return out_tensor
+        # if self.nki_enabled:
+        #     out_tensor = nki_rmsnorm_kernel(hidden_states, self.weight, self.variance_epsilon)
+        #     return out_tensor
 
         original_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
-        print("rms_test:", hidden_states.size())
-        print("weights_size:", self.weight.size())
         result = RmsNorm.apply(
             hidden_states, self.weight, self.variance_epsilon, len(hidden_states.shape) - 1
         )
@@ -1403,9 +1401,13 @@ class NeuronLlamaAttention(NeuronAttentionBase):
             self.tp_degree = 1
 
         self.fused_qkv = config.neuron_config.fused_qkv
+        # print("fused_qkv:", self.fused_qkv)
+        self.fused_qkv = True
         self.clip_qkv = None
 
         self.sequence_parallel_enabled = self.neuron_config.sequence_parallel_enabled
+        # print("sequence_parallel_enabled:", self.sequence_parallel_enabled)
+        # self.sequence_parallel_enabled = True
         self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
         # logger.debug(
         #     f"Hello from NeuronLlamaAttention init! Is SP enabled? {self.sequence_parallel_enabled}. Dim? {self.sequence_dimension}"
@@ -1481,7 +1483,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         """attention computation at token generation phase"""
         is_speculation = position_ids.shape[-1] > 1
         
-        print("USE SUBCLASS TOKEN GEN: is_spec is", is_speculation)
+        # print("USE SUBCLASS TOKEN GEN: is_spec is", is_speculation)
 
         # Attention computation: softmax((Q.K/√dkv) + mask).V
         # i. prior (cached) KV
@@ -1528,7 +1530,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
     ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
         """Implements each layer's forward pass for the attention block."""
 
-        print("USE SUBCLASS FORWARD")
+        # print("USE SUBCLASS FORWARD")
 
         bsz, q_len, _ = hidden_states.size()
         if self.sequence_parallel_enabled:
@@ -1941,6 +1943,8 @@ class NeuronLlamaForCausalLM(NeuronBaseForCausalLM):
     @staticmethod
     def convert_hf_to_neuron_state_dict(state_dict: dict, config: InferenceConfig) -> dict:
         """This function should be over-ridden in child classes as needed"""
+        config.neuron_config.fused_qkv = True
+        # config.neuron_config.sequence_parallel_enabled = True
         neuron_config = config.neuron_config
         if neuron_config.fused_qkv:
             state_dict = convert_state_dict_to_fused_qkv(state_dict, config)
