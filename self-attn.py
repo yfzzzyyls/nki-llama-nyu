@@ -726,9 +726,6 @@ def compute_for_token_gen(
     Returns:
       attn_out: [B, heads, seq_q, d_head]
     """
-    import torch
-    import torch.nn.functional as F
-    from neuronx_distributed_inference.modules.attention.utils import repeat_kv
 
     # 1) Merge old + new
     K_cat = torch.cat([K_prev, K_active], dim=2)  # [B, heads, seq_k, d_head]
@@ -880,45 +877,95 @@ def compute_for_token_gen(
 ################################################################################
 
 def test_compute_for_token_gen():
-    # 1) Pick the XLA device
+    # 1) Choose the XLA device (e.g., on AWS Trainium)
     device = xm.xla_device()  # or torch.device("privateuseone")
 
     torch.manual_seed(0)
 
     B, H = 2, 3
     seq_prev, seq_active, seq_q = 4, 2, 2
-    d_head = 64  # must be <=128 for fused kernel
+    d_head = 64  # must be <=128 for our fused kernel
 
-    # 2) Generate data on CPU, then move to XLA device
+    # 2) Generate random data for Q, K, V on CPU, then move to XLA device
     Q = torch.randn(B, H, seq_q, d_head, dtype=torch.float32).to(device)
     K_prev = torch.randn(B, H, seq_prev, d_head, dtype=torch.float32).to(device)
     K_active = torch.randn(B, H, seq_active, d_head, dtype=torch.float32).to(device)
     V_prev = torch.randn(B, H, seq_prev, d_head, dtype=torch.float32).to(device)
     V_active = torch.randn(B, H, seq_active, d_head, dtype=torch.float32).to(device)
 
-    # 3) Run your reference code (it can be CPU or XLA, but for fair comparison, 
-    #    you might also do .to(device) to keep everything consistent)
-    out_ref = compute_for_token_gen_ref(
+    ############################################################################
+    #  A) Test WITHOUT any attention_mask (but use_causal_mask=True)
+    ############################################################################
+    print("==== Test #1: No explicit attention_mask, causal=True ====")
+    out_ref_causal = compute_for_token_gen_ref(
         Q, K_prev, K_active, V_prev, V_active,
         attention_mask=None,
         use_causal_mask=True
     )
-
-    # 4) Run NKI-based kernel call (now all on XLA device)
-    out_nki = compute_for_token_gen(
+    out_nki_causal = compute_for_token_gen(
         Q, K_prev, K_active, V_prev, V_active,
         attention_mask=None,
         use_causal_mask=True
     )
+    # Compare on CPU
+    ref_cpu_causal = out_ref_causal.cpu()
+    nki_cpu_causal = out_nki_causal.cpu()
 
-    # 5) For printing or comparing on CPU, move results back
-    out_ref_cpu = out_ref.cpu()
-    out_nki_cpu = out_nki.cpu()
+    max_diff_causal = (ref_cpu_causal - nki_cpu_causal).abs().max().item()
+    print(f"Max diff (no attention_mask, causal=True) = {max_diff_causal:.6e}")
 
-    max_abs_diff = (out_ref_cpu - out_nki_cpu).abs().max().item()
-    print(f"[TEST] max_abs_diff between reference & NKI kernel = {max_abs_diff:.6e}")
-    print("Ref output:", out_ref_cpu[0, 0, 0, :8])
-    print("NKI output:", out_nki_cpu[0, 0, 0, :8])
+    ############################################################################
+    #  B) Test WITH a random Boolean attention_mask, no causal mask
+    ############################################################################
+    print("\n==== Test #2: With random attention_mask, causal=False ====")
+    # The attention_mask shape must be [B, H, seq_q, seq_prev+seq_active],
+    # i.e. [2, 3, 2, 4+2=6].
+    seq_k = seq_prev + seq_active
+    attn_mask = (torch.rand(B, H, seq_q, seq_k, dtype=torch.float32).to(device) > 0.5)
+
+    out_ref_mask = compute_for_token_gen_ref(
+        Q, K_prev, K_active, V_prev, V_active,
+        attention_mask=attn_mask,
+        use_causal_mask=False
+    )
+    out_nki_mask = compute_for_token_gen(
+        Q, K_prev, K_active, V_prev, V_active,
+        attention_mask=attn_mask,
+        use_causal_mask=False
+    )
+    ref_mask_cpu = out_ref_mask.cpu()
+    nki_mask_cpu = out_nki_mask.cpu()
+    max_diff_mask = (ref_mask_cpu - nki_mask_cpu).abs().max().item()
+    print(f"Max diff (random attention_mask, causal=False) = {max_diff_mask:.6e}")
+
+    ############################################################################
+    #  C) Test WITH the same random Boolean attention_mask, but now also causal
+    ############################################################################
+    print("\n==== Test #3: With random attention_mask, causal=True ====")
+    out_ref_mask_causal = compute_for_token_gen_ref(
+        Q, K_prev, K_active, V_prev, V_active,
+        attention_mask=attn_mask,
+        use_causal_mask=True
+    )
+    out_nki_mask_causal = compute_for_token_gen(
+        Q, K_prev, K_active, V_prev, V_active,
+        attention_mask=attn_mask,
+        use_causal_mask=True
+    )
+    ref_mask_causal_cpu = out_ref_mask_causal.cpu()
+    nki_mask_causal_cpu = out_nki_mask_causal.cpu()
+    max_diff_mask_causal = (ref_mask_causal_cpu - nki_mask_causal_cpu).abs().max().item()
+    print(f"Max diff (random attention_mask, causal=True) = {max_diff_mask_causal:.6e}")
+
+    ############################################################################
+    #  D) Print summary
+    ############################################################################
+    print("\n==== Summary of Differences ====")
+    print(f"1) no mask, causal=True   => max diff = {max_diff_causal:.6e}")
+    print(f"2) random mask, causal=F => max diff = {max_diff_mask:.6e}")
+    print(f"3) random mask, causal=T => max diff = {max_diff_mask_causal:.6e}")
+
+    # Done!
 
 
 if __name__ == "__main__":
