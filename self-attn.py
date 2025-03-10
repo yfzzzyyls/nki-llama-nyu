@@ -69,77 +69,342 @@ import neuronxcc.nki.isa as nisa
 import os
 from torch_xla.core import xla_model as xm
 
+# @nki.jit
+# def fused_self_attn_for_SD_small_head_size(
+# #     q_ref,
+# #     k_ref,
+# #     v_ref,
+# #     use_causal_mask=False,
+# #     mixed_precision=True
+# # ):
+# #     """
+# #     Fused self attention kernel for small head dimension Stable Diffusion workload,
+# #     simplified for this tutorial.
+
+# #     Computes softmax(QK^T)V. Decoder model can optionally include a causal mask
+# #     application. Does not include QKV projection, output projection, dropout,
+# #     residual connection, etc.
+
+# #     This kernel is designed to be used for Stable Diffusion models where the
+# #     d_head is smaller or equal to 128. Assertion is thrown if `d_head` does
+# #     not satisfy the requirement.
+
+# #     IO tensor layouts:
+# #       - q_ref: shape (seq_q, d_head)
+# #       - k_ref: shape (seq_k, d_head)
+# #       - v_ref: shape (seq_v, d_head)
+# #       - out_ref: shape (seq_q, d_head)
+# #       - We use seq_q and seq_k and seq_v just for clarity, this kernel
+# #         requires seq_q == seq_k == seq_v.
+
+# #     IO tensor dtypes:
+# #       - This kernel assumes all IO tensors have the same dtype.
+# #       - If mixed_precision is True, then all Tensor Engine operations
+# #         will be performed in bfloat16 and accumulation will be performed
+# #         in float32. Otherwise, the intermediates will be in the same
+# #         type as the inputs.
+# #     """
+# #     # Use q_ref dtype as the intermediate tensor dtype
+# #     # Assume all IO tensors have the same dtype
+# #     kernel_dtype = q_ref.dtype
+# #     pe_in_dt = nl.bfloat16 if mixed_precision else np.float32
+# #     assert q_ref.dtype == k_ref.dtype == v_ref.dtype
+
+# #     # Shape checking
+# #     seqlen, d_head = q_ref.shape
+# #     assert d_head <= 128, "Cannot use this kernel for d_head > 128"
+# #     assert tuple(q_ref.shape) == (seqlen, d_head), "Input shape mismatch!"
+# #     assert tuple(k_ref.shape) == (seqlen, d_head), "Input shape mismatch!"
+# #     assert tuple(v_ref.shape) == (seqlen, d_head), (
+# #         f"Input shape mismatch! Expected: {(seqlen, d_head)} "
+# #         f"Actual: {tuple(v_ref.shape)}"
+# #     )
+# #     out_ref = nl.ndarray((seqlen, d_head), dtype=q_ref.dtype, buffer=nl.shared_hbm)
+
+# #     # Softmax scaling factor, multiplied onto Q
+# #     softmax_scale = 0.125
+
+# #     q_seq_n_tiles, q_seq_tile_size = seqlen // 128, 128
+# #     k_seq_n_tiles, k_seq_tile_size = seqlen // 128, 128
+# #     # No tiling on d_head dimension since the dimension of d_head fits in SB
+# #     d_head_tile_size = d_head
+# #     v_seq_n_tiles, v_seq_tile_size = seqlen // 128, 128
+
+# #     # -----------------------------------------------
+# #     # Step 1. transpose(tensor_v)
+# #     # -----------------------------------------------
+# #     # Buffer for v matrix transposed
+# #     # Pre-fetch and keep it in SBUF throughout different softmax tiles
+# #     trans_v = nl.ndarray(
+# #         (nl.par_dim(v_seq_tile_size), v_seq_n_tiles, d_head),
+# #         dtype=pe_in_dt
+# #     )
+
+# #     for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
+# #         ip_v = nl.arange(v_seq_tile_size)[:, None]
+# #         if_v = nl.arange(d_head_tile_size)[None, :]
+# #         trans_v[ip_v, i_k_seq_tile, if_v] = nl.load(
+# #             v_ref[i_k_seq_tile * k_seq_tile_size + ip_v, if_v],
+# #             dtype=pe_in_dt
+# #         )
+
+# #     # -----------------------------------------------
+# #     # Prepare local Q tiles
+# #     # -----------------------------------------------
+# #     q_local = nl.ndarray(
+# #         (q_seq_n_tiles, nl.par_dim(d_head_tile_size), q_seq_tile_size),
+# #         dtype=pe_in_dt
+# #     )
+# #     ip_q = nl.arange(d_head_tile_size)[:, None]
+# #     if_q = nl.arange(q_seq_tile_size)[None, :]
+# #     for i_q_seq_tile in nl.affine_range(q_seq_n_tiles):
+# #         q_local[i_q_seq_tile, ip_q, if_q] = nl.load_transpose2d(
+# #             q_ref[
+# #                 i_q_seq_tile * q_seq_tile_size
+# #                 + nl.arange(q_seq_tile_size)[:, None],
+# #                 nl.arange(d_head_tile_size)[None, :]
+# #             ],
+# #             dtype=pe_in_dt
+# #         ) * softmax_scale
+
+# #     # -----------------------------------------------
+# #     # Prepare local K tiles
+# #     # -----------------------------------------------
+# #     k_local = nl.ndarray(
+# #         (k_seq_n_tiles, nl.par_dim(d_head_tile_size), k_seq_tile_size),
+# #         dtype=pe_in_dt
+# #     )
+# #     ip_k = nl.arange(d_head_tile_size)[:, None]
+# #     if_k = nl.arange(k_seq_tile_size)[None, :]
+# #     for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
+# #         k_local[i_k_seq_tile, ip_k, if_k] = nl.load_transpose2d(
+# #             k_ref[
+# #                 i_k_seq_tile * k_seq_tile_size
+# #                 + nl.arange(k_seq_tile_size)[:, None],
+# #                 nl.arange(d_head_tile_size)[None, :]
+# #             ],
+# #             dtype=pe_in_dt
+# #         )
+
+# #     # -----------------------------------------------
+# #     # Perform QK^T + optional mask + softmax + multiply by V
+# #     # -----------------------------------------------
+# #     for i_q_seq_tile in nl.affine_range(q_seq_n_tiles):
+# #         # A SBUF buffer for an independent softmax tile
+# #         qk_res_buf = nl.ndarray(
+# #             (nl.par_dim(q_seq_tile_size), seqlen),
+# #             dtype=kernel_dtype
+# #         )
+# #         neg_max_res = nl.ndarray(
+# #             (nl.par_dim(q_seq_tile_size), k_seq_n_tiles),
+# #             dtype=kernel_dtype
+# #         )
+# #         ip_max = nl.arange(q_seq_tile_size)[:, None]
+# #         if_max = nl.arange(k_seq_n_tiles)[None, :]
+
+# #         # Loop over RHS free of matmul(stationary=tensor_q, moving=tensor_k, contract=d_head)
+# #         for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
+# #             # PSUM buffer shape: [q_seq_tile_size P, k_seq_tile_size F]
+# #             qk_psum = nl.zeros(
+# #                 (nl.par_dim(q_seq_tile_size), k_seq_tile_size),
+# #                 dtype=np.float32,
+# #                 buffer=nl.psum
+# #             )
+# #             ip_qk = nl.arange(q_seq_tile_size)[:, None]
+# #             if_qk = nl.arange(k_seq_tile_size)[None, :]
+
+# #             # Step 2. matmul(stationary=tensor_q, moving=tensor_k, contract=d_head)
+# #             qk_psum[ip_qk, if_qk] += nisa.nc_matmul(
+# #                 moving=k_local[i_k_seq_tile, ip_k, if_k],
+# #                 stationary=q_local[i_q_seq_tile, ip_q, if_q]
+# #             )
+
+# #             # Step 3. Apply optional causal mask
+# #             if use_causal_mask:
+# #                 # Magic number -9984.0 to replace -inf (like neuronx-cc)
+# #                 qk_res_buf[
+# #                     ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk
+# #                 ] = nisa.affine_select(
+# #                     pred=(
+# #                         i_q_seq_tile * q_seq_tile_size + ip_qk
+# #                         >= i_k_seq_tile * k_seq_tile_size + if_qk
+# #                     ),
+# #                     on_true_tile=qk_psum[ip_qk, if_qk],
+# #                     on_false_value=-9984.0,
+# #                     dtype=kernel_dtype
+# #                 )
+# #             else:
+# #                 # Simply send psum result back to sbuf
+# #                 qk_res_buf[
+# #                     ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk
+# #                 ] = nl.copy(qk_psum[ip_qk, if_qk], dtype=kernel_dtype)
+
+# #             # Step 4. Softmax (partial, track negative max)
+# #             neg_max_res[ip_max, i_k_seq_tile] = nisa.tensor_reduce(
+# #                 np.max,
+# #                 data=qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk],
+# #                 axis=(1,),
+# #                 dtype=kernel_dtype,
+# #                 negate=True
+# #             )
+
+# #         neg_max_res_final = nisa.tensor_reduce(
+# #             np.min,
+# #             data=neg_max_res[ip_max, if_max],
+# #             axis=(1,),
+# #             dtype=kernel_dtype,
+# #             negate=False
+# #         )
+
+# #         ip_softmax = nl.arange(q_seq_tile_size)[:, None]
+# #         if_softmax = nl.arange(seqlen)[None, :]
+# #         ip_sum_res = nl.arange(q_seq_tile_size)[:, None]
+# #         if_sum_res = nl.arange(d_head_tile_size)[None, :]
+
+# #         softmax_res = nl.ndarray(
+# #             (nl.par_dim(q_seq_tile_size), seqlen),
+# #             dtype=pe_in_dt
+# #         )
+# #         sum_divisor = nl.ndarray(
+# #             (nl.par_dim(q_seq_tile_size), d_head_tile_size),
+# #             dtype=kernel_dtype
+# #         )
+
+# #         # Exponential + reduce
+# #         exp_res = nisa.activation(
+# #             np.exp,
+# #             data=qk_res_buf[ip_softmax, if_softmax],
+# #             bias=neg_max_res_final,
+# #             scale=1.0
+# #         )
+# #         sum_res = nisa.tensor_reduce(
+# #             np.add,
+# #             data=exp_res,
+# #             axis=(1,),
+# #             dtype=kernel_dtype
+# #         )
+# #         softmax_res[ip_softmax, if_softmax] = nl.copy(exp_res, dtype=pe_in_dt)
+
+# #         sum_reciprocal_broadcast = (1.0 / sum_res).broadcast_to(
+# #             (q_seq_tile_size, d_head_tile_size)
+# #         )
+# #         sum_divisor[ip_sum_res, if_sum_res] = nl.copy(
+# #             sum_reciprocal_broadcast,
+# #             dtype=kernel_dtype
+# #         )
+
+# #         # Buffer for transposed softmax results (FP32 in PSUM)
+# #         trans_softmax_res = nl.ndarray(
+# #             (nl.par_dim(k_seq_tile_size), k_seq_n_tiles, q_seq_tile_size),
+# #             dtype=pe_in_dt
+# #         )
+
+# #         # Result psum buffer has the hidden dim as P
+# #         attn_res_psum = nl.zeros(
+# #             (nl.par_dim(d_head_tile_size), q_seq_tile_size),
+# #             dtype=np.float32,
+# #             buffer=nl.psum
+# #         )
+
+# #         ip_scores_t = nl.arange(k_seq_tile_size)[:, None]
+# #         if_scores_t = nl.arange(q_seq_tile_size)[None, :]
+
+# #         # Step 5. transpose(softmax_res) for each tile
+# #         for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
+# #             ip_scores = nl.arange(q_seq_tile_size)[:, None]
+# #             if_scores = nl.arange(k_seq_tile_size)[None, :]
+# #             trans_softmax_res[ip_scores_t, i_k_seq_tile, if_scores_t] = nisa.nc_transpose(
+# #                 softmax_res[ip_scores, i_k_seq_tile * k_seq_tile_size + if_scores]
+# #             )
+
+# #         # Step 6. matmul_1(stationary=trans_v, moving=trans_softmax_res)
+# #         ip_out = nl.arange(d_head_tile_size)[:, None]
+# #         if_out = nl.arange(q_seq_tile_size)[None, :]
+# #         for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
+# #             ip_v_t = nl.arange(k_seq_tile_size)[:, None]
+# #             if_v_t = nl.arange(d_head_tile_size)[None, :]
+# #             attn_res_psum[ip_out, if_out] += nisa.nc_matmul(
+# #                 moving=trans_softmax_res[ip_scores_t, i_k_seq_tile, if_scores_t],
+# #                 stationary=trans_v[ip_v_t, i_k_seq_tile, if_v_t]
+# #             )
+
+# #         attn_res_sbuf = nl.copy(
+# #             attn_res_psum[ip_out, if_out],
+# #             dtype=kernel_dtype
+# #         )
+# #         attn_res_div = attn_res_sbuf * nisa.nc_transpose(
+# #             sum_divisor[ip_sum_res, if_sum_res]
+# #         )
+
+# #         nl.store(
+# #             out_ref[i_q_seq_tile * q_seq_tile_size + if_out, ip_out],
+# #             value=attn_res_div
+# #         )
+
+# #     return out_ref
+
+
 @nki.jit
 def fused_self_attn_for_SD_small_head_size(
     q_ref,
     k_ref,
     v_ref,
     use_causal_mask=False,
-    mixed_precision=True
+    mixed_precision=True,
+    mask_ref=None,  # new optional arg: shape=(seqlen, seqlen), bool
 ):
     """
-    Fused self attention kernel for small head dimension Stable Diffusion workload,
-    simplified for this tutorial.
+    Fused self-attention kernel for small head dimension (<=128), with optional
+    user-provided mask_ref (bool 2D) and optional causal mask.
 
-    Computes softmax(QK^T)V. Decoder model can optionally include a causal mask
-    application. Does not include QKV projection, output projection, dropout,
-    residual connection, etc.
+    If mask_ref is not None, we set QK=-9984.0 wherever mask_ref[i, j] is False.
+    If use_causal_mask=True, we also apply the lower-triangular mask, effectively
+    combining it with mask_ref (logical AND).
+    
+    Args:
+      q_ref: (seqlen, d_head)
+      k_ref: (seqlen, d_head)
+      v_ref: (seqlen, d_head)
+      use_causal_mask: bool
+      mixed_precision: bool
+      mask_ref: optional bool Tensor of shape (seqlen, seqlen)
 
-    This kernel is designed to be used for Stable Diffusion models where the
-    d_head is smaller or equal to 128. Assertion is thrown if `d_head` does
-    not satisfy the requirement.
-
-    IO tensor layouts:
-      - q_ref: shape (seq_q, d_head)
-      - k_ref: shape (seq_k, d_head)
-      - v_ref: shape (seq_v, d_head)
-      - out_ref: shape (seq_q, d_head)
-      - We use seq_q and seq_k and seq_v just for clarity, this kernel
-        requires seq_q == seq_k == seq_v.
-
-    IO tensor dtypes:
-      - This kernel assumes all IO tensors have the same dtype.
-      - If mixed_precision is True, then all Tensor Engine operations
-        will be performed in bfloat16 and accumulation will be performed
-        in float32. Otherwise, the intermediates will be in the same
-        type as the inputs.
+    Returns:
+      out_ref: (seqlen, d_head)
     """
-    # Use q_ref dtype as the intermediate tensor dtype
-    # Assume all IO tensors have the same dtype
+
     kernel_dtype = q_ref.dtype
     pe_in_dt = nl.bfloat16 if mixed_precision else np.float32
-    assert q_ref.dtype == k_ref.dtype == v_ref.dtype
 
-    # Shape checking
+    assert q_ref.dtype == k_ref.dtype == v_ref.dtype
     seqlen, d_head = q_ref.shape
-    assert d_head <= 128, "Cannot use this kernel for d_head > 128"
-    assert tuple(q_ref.shape) == (seqlen, d_head), "Input shape mismatch!"
+    assert d_head <= 128, "Cannot use kernel for d_head>128"
     assert tuple(k_ref.shape) == (seqlen, d_head), "Input shape mismatch!"
-    assert tuple(v_ref.shape) == (seqlen, d_head), (
-        f"Input shape mismatch! Expected: {(seqlen, d_head)} "
-        f"Actual: {tuple(v_ref.shape)}"
-    )
+    assert tuple(v_ref.shape) == (seqlen, d_head), "Input shape mismatch!"
+
+    if mask_ref is not None:
+        # mask_ref must match [seqlen, seqlen]
+        assert mask_ref.shape == (seqlen, seqlen), "mask_ref shape mismatch!"
+
+    # Allocate output
     out_ref = nl.ndarray((seqlen, d_head), dtype=q_ref.dtype, buffer=nl.shared_hbm)
 
-    # Softmax scaling factor, multiplied onto Q
+    # For demonstration, a constant scale=0.125:
     softmax_scale = 0.125
 
+    # Prepare tiling
     q_seq_n_tiles, q_seq_tile_size = seqlen // 128, 128
     k_seq_n_tiles, k_seq_tile_size = seqlen // 128, 128
-    # No tiling on d_head dimension since the dimension of d_head fits in SB
     d_head_tile_size = d_head
     v_seq_n_tiles, v_seq_tile_size = seqlen // 128, 128
 
-    # -----------------------------------------------
-    # Step 1. transpose(tensor_v)
-    # -----------------------------------------------
-    # Buffer for v matrix transposed
-    # Pre-fetch and keep it in SBUF throughout different softmax tiles
+    #----------------------------------
+    # 1) Transpose V
+    #----------------------------------
     trans_v = nl.ndarray(
         (nl.par_dim(v_seq_tile_size), v_seq_n_tiles, d_head),
         dtype=pe_in_dt
     )
-
     for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
         ip_v = nl.arange(v_seq_tile_size)[:, None]
         if_v = nl.arange(d_head_tile_size)[None, :]
@@ -148,9 +413,9 @@ def fused_self_attn_for_SD_small_head_size(
             dtype=pe_in_dt
         )
 
-    # -----------------------------------------------
-    # Prepare local Q tiles
-    # -----------------------------------------------
+    #----------------------------------
+    # 2) Load + scale Q
+    #----------------------------------
     q_local = nl.ndarray(
         (q_seq_n_tiles, nl.par_dim(d_head_tile_size), q_seq_tile_size),
         dtype=pe_in_dt
@@ -167,9 +432,9 @@ def fused_self_attn_for_SD_small_head_size(
             dtype=pe_in_dt
         ) * softmax_scale
 
-    # -----------------------------------------------
-    # Prepare local K tiles
-    # -----------------------------------------------
+    #----------------------------------
+    # 3) Load K
+    #----------------------------------
     k_local = nl.ndarray(
         (k_seq_n_tiles, nl.par_dim(d_head_tile_size), k_seq_tile_size),
         dtype=pe_in_dt
@@ -186,11 +451,10 @@ def fused_self_attn_for_SD_small_head_size(
             dtype=pe_in_dt
         )
 
-    # -----------------------------------------------
-    # Perform QK^T + optional mask + softmax + multiply by V
-    # -----------------------------------------------
+    #----------------------------------
+    # 4) Q*K^T, apply mask(s), softmax, then multiply by V
+    #----------------------------------
     for i_q_seq_tile in nl.affine_range(q_seq_n_tiles):
-        # A SBUF buffer for an independent softmax tile
         qk_res_buf = nl.ndarray(
             (nl.par_dim(q_seq_tile_size), seqlen),
             dtype=kernel_dtype
@@ -202,9 +466,8 @@ def fused_self_attn_for_SD_small_head_size(
         ip_max = nl.arange(q_seq_tile_size)[:, None]
         if_max = nl.arange(k_seq_n_tiles)[None, :]
 
-        # Loop over RHS free of matmul(stationary=tensor_q, moving=tensor_k, contract=d_head)
+        # (A) Dot product for each tile
         for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
-            # PSUM buffer shape: [q_seq_tile_size P, k_seq_tile_size F]
             qk_psum = nl.zeros(
                 (nl.par_dim(q_seq_tile_size), k_seq_tile_size),
                 dtype=np.float32,
@@ -213,36 +476,51 @@ def fused_self_attn_for_SD_small_head_size(
             ip_qk = nl.arange(q_seq_tile_size)[:, None]
             if_qk = nl.arange(k_seq_tile_size)[None, :]
 
-            # Step 2. matmul(stationary=tensor_q, moving=tensor_k, contract=d_head)
+            # matmul
             qk_psum[ip_qk, if_qk] += nisa.nc_matmul(
                 moving=k_local[i_k_seq_tile, ip_k, if_k],
                 stationary=q_local[i_q_seq_tile, ip_q, if_q]
             )
 
-            # Step 3. Apply optional causal mask
+            # (B) Combine user mask + causal mask if necessary
+            pred_bool = None
+            if mask_ref is not None:
+                pred_bool = mask_ref[
+                    i_q_seq_tile * q_seq_tile_size + ip_qk,
+                    i_k_seq_tile * k_seq_tile_size + if_qk
+                ]  # shape=(q_seq_tile_size, k_seq_tile_size)
+
             if use_causal_mask:
-                # Magic number -9984.0 to replace -inf (like neuronx-cc)
-                qk_res_buf[
-                    ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk
-                ] = nisa.affine_select(
-                    pred=(
-                        i_q_seq_tile * q_seq_tile_size + ip_qk
-                        >= i_k_seq_tile * k_seq_tile_size + if_qk
-                    ),
+                causal_pred = (
+                    i_q_seq_tile * q_seq_tile_size + ip_qk
+                    >= i_k_seq_tile * k_seq_tile_size + if_qk
+                )
+                if pred_bool is None:
+                    pred_bool = causal_pred
+                else:
+                    # combine with user-provided mask
+                    pred_bool = pred_bool & causal_pred
+
+            if pred_bool is not None:
+                qk_res_buf[ip_qk, i_k_seq_tile*k_seq_tile_size + if_qk] = nisa.affine_select(
+                    pred=pred_bool,
                     on_true_tile=qk_psum[ip_qk, if_qk],
-                    on_false_value=-9984.0,
+                    on_false_value=-9984.0,  # effectively -inf
                     dtype=kernel_dtype
                 )
             else:
-                # Simply send psum result back to sbuf
-                qk_res_buf[
-                    ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk
-                ] = nl.copy(qk_psum[ip_qk, if_qk], dtype=kernel_dtype)
+                # no mask
+                qk_res_buf[ip_qk, i_k_seq_tile*k_seq_tile_size + if_qk] = nl.copy(
+                    qk_psum[ip_qk, if_qk],
+                    dtype=kernel_dtype
+                )
 
-            # Step 4. Softmax (partial, track negative max)
+            # track partial max
             neg_max_res[ip_max, i_k_seq_tile] = nisa.tensor_reduce(
                 np.max,
-                data=qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk],
+                data=qk_res_buf[
+                    ip_qk, i_k_seq_tile*k_seq_tile_size + if_qk
+                ],
                 axis=(1,),
                 dtype=kernel_dtype,
                 negate=True
@@ -256,10 +534,9 @@ def fused_self_attn_for_SD_small_head_size(
             negate=False
         )
 
+        # (C) Softmax
         ip_softmax = nl.arange(q_seq_tile_size)[:, None]
         if_softmax = nl.arange(seqlen)[None, :]
-        ip_sum_res = nl.arange(q_seq_tile_size)[:, None]
-        if_sum_res = nl.arange(d_head_tile_size)[None, :]
 
         softmax_res = nl.ndarray(
             (nl.par_dim(q_seq_tile_size), seqlen),
@@ -270,7 +547,6 @@ def fused_self_attn_for_SD_small_head_size(
             dtype=kernel_dtype
         )
 
-        # Exponential + reduce
         exp_res = nisa.activation(
             np.exp,
             data=qk_res_buf[ip_softmax, if_softmax],
@@ -288,18 +564,18 @@ def fused_self_attn_for_SD_small_head_size(
         sum_reciprocal_broadcast = (1.0 / sum_res).broadcast_to(
             (q_seq_tile_size, d_head_tile_size)
         )
+        ip_sum_res = nl.arange(q_seq_tile_size)[:, None]
+        if_sum_res = nl.arange(d_head_tile_size)[None, :]
         sum_divisor[ip_sum_res, if_sum_res] = nl.copy(
             sum_reciprocal_broadcast,
             dtype=kernel_dtype
         )
 
-        # Buffer for transposed softmax results (FP32 in PSUM)
+        # (D) Multiply by V
         trans_softmax_res = nl.ndarray(
             (nl.par_dim(k_seq_tile_size), k_seq_n_tiles, q_seq_tile_size),
             dtype=pe_in_dt
         )
-
-        # Result psum buffer has the hidden dim as P
         attn_res_psum = nl.zeros(
             (nl.par_dim(d_head_tile_size), q_seq_tile_size),
             dtype=np.float32,
@@ -308,8 +584,6 @@ def fused_self_attn_for_SD_small_head_size(
 
         ip_scores_t = nl.arange(k_seq_tile_size)[:, None]
         if_scores_t = nl.arange(q_seq_tile_size)[None, :]
-
-        # Step 5. transpose(softmax_res) for each tile
         for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
             ip_scores = nl.arange(q_seq_tile_size)[:, None]
             if_scores = nl.arange(k_seq_tile_size)[None, :]
@@ -317,7 +591,6 @@ def fused_self_attn_for_SD_small_head_size(
                 softmax_res[ip_scores, i_k_seq_tile * k_seq_tile_size + if_scores]
             )
 
-        # Step 6. matmul_1(stationary=trans_v, moving=trans_softmax_res)
         ip_out = nl.arange(d_head_tile_size)[:, None]
         if_out = nl.arange(q_seq_tile_size)[None, :]
         for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
@@ -342,6 +615,7 @@ def fused_self_attn_for_SD_small_head_size(
         )
 
     return out_ref
+
 
 
 ################################################################################
@@ -417,83 +691,187 @@ def compute_for_token_gen_ref(
 #    We'll unify old & new K/V, flatten each batch/head, call the fused kernel.
 ################################################################################
 
-import torch
-import torch.nn.functional as F
-import math
 
-def compute_for_token_gen_nki(
-    Q,           # (batch, heads, seq_q, d_head)
-    K_prev,      # (batch, heads, seq_prev, d_head)
-    K_active,    # (batch, heads, seq_active, d_head)
-    V_prev,      # (batch, heads, seq_prev, d_head)
-    V_active,    # (batch, heads, seq_active, d_head)
-    attention_mask=None,  # bool or None
-    use_causal_mask=False
+def compute_for_token_gen(
+    Q,
+    K_prev,
+    K_active,
+    V_prev,
+    V_active,
+    attention_mask=None,
+    use_causal_mask=False,
+    position_ids=None,
+    past_key_value=None,
+    active_mask=None
 ):
     """
-    Use the fused_self_attn_for_SD_small_head_size kernel, 
-    forcing the sequence dimension up to a multiple of 128 so 
-    that the kernel's loops run.
-    """
-    device = Q.device
-    dtype = Q.dtype
-    B, H, seq_q, d_head = Q.shape
+    NKI-based token generation attention:
+      - Merges (K_prev, V_prev) with (K_active, V_active)
+      - Pads Q/K/V to multiples of 128 for the fused kernel
+      - Passes optional attention_mask as a 2D mask (per B,H slice)
+      - Applies optional use_causal_mask
 
-    # Concatenate old & new keys/values:
-    K_cat = torch.cat([K_prev, K_active], dim=2)  # shape = (B,H, seq_k, d_head)
+    Args:
+      Q: [B, heads, seq_q, d_head]
+      K_prev: [B, heads, seq_prev, d_head]
+      K_active: [B, heads, seq_active, d_head]
+      V_prev: [B, heads, seq_prev, d_head]
+      V_active: [B, heads, seq_active, d_head]
+      attention_mask: (optional) [B, heads, seq_q, seq_prev+seq_active] bool
+      use_causal_mask: bool
+      position_ids: (not used here, but kept for signature)
+      past_key_value: (not used here, but kept for signature)
+      active_mask: (not used, but kept for signature)
+
+    Returns:
+      attn_out: [B, heads, seq_q, d_head]
+    """
+    import torch
+    import torch.nn.functional as F
+    from neuronx_distributed_inference.modules.attention.utils import repeat_kv
+
+    # 1) Merge old + new
+    K_cat = torch.cat([K_prev, K_active], dim=2)  # [B, heads, seq_k, d_head]
     V_cat = torch.cat([V_prev, V_active], dim=2)
+
+    B, H, seq_q, d_head = Q.shape
     seq_k = K_cat.shape[2]
 
-    # We'll produce [B, H, seq_q, d_head] as our final output
+    # Final output [B, heads, seq_q, d_head]
     attn_out = torch.empty_like(Q)
 
-    # 1) Determine the final padded_len so seq_q and seq_k 
-    #    become the same multiple-of-128 dimension:
-    padded_len = max(seq_q, seq_k)
-
-    # If you want a minimum of 128:
-    if padded_len < 128:
-        padded_len = 128
-
-    # Now round up to the nearest multiple of 128:
+    # 2) Decide how much to pad up to multiples of 128
+    padded_len = max(seq_q, seq_k, 128)
     if padded_len % 128 != 0:
         padded_len = ((padded_len + 127) // 128) * 128
 
+    # 3) Loop over each (batch, head), slice out Q,K,V, mask
     for b in range(B):
         for h in range(H):
-            # Extract Q, K, V slices for this (b,h)
-            q_2d = Q[b, h]            # shape (seq_q, d_head)
-            k_2d = K_cat[b, h]        # shape (seq_k, d_head)
-            v_2d = V_cat[b, h]        # shape (seq_k, d_head)
+            q_2d = Q[b, h]       # shape (seq_q, d_head)
+            k_2d = K_cat[b, h]   # shape (seq_k, d_head)
+            v_2d = V_cat[b, h]   # shape (seq_k, d_head)
 
-            # 2) Pad Q, K, V so each becomes (padded_len, d_head)
-            q_2d_padded = F.pad(
-                q_2d, (0, 0, 0, padded_len - seq_q)
-            ) if seq_q < padded_len else q_2d
+            # Build a 2D user_mask => shape (seq_q, seq_k) if attention_mask is given
+            if attention_mask is not None:
+                user_mask_2d = attention_mask[b, h]  # shape (seq_q, seq_k)
+            else:
+                user_mask_2d = None
 
-            k_2d_padded = F.pad(
-                k_2d, (0, 0, 0, padded_len - seq_k)
-            ) if seq_k < padded_len else k_2d
+            # Pad Q
+            if seq_q < padded_len:
+                q_2d_padded = F.pad(q_2d, (0, 0, 0, padded_len - seq_q))
+            else:
+                q_2d_padded = q_2d
 
-            v_2d_padded = F.pad(
-                v_2d, (0, 0, 0, padded_len - seq_k)
-            ) if seq_k < padded_len else v_2d
+            # Pad K, V
+            if seq_k < padded_len:
+                k_2d_padded = F.pad(k_2d, (0, 0, 0, padded_len - seq_k))
+                v_2d_padded = F.pad(v_2d, (0, 0, 0, padded_len - seq_k))
+            else:
+                k_2d_padded = k_2d
+                v_2d_padded = v_2d
 
-            # 3) Call the fused kernel with the padded shapes
+            # Pad mask if we have one => shape (padded_len, padded_len)
+            if user_mask_2d is not None:
+                # pad order: (left, right, top, bottom)
+                user_mask_2d_padded = F.pad(
+                    user_mask_2d,
+                    (0, padded_len - seq_k, 0, padded_len - seq_q),
+                    value=False
+                )
+            else:
+                user_mask_2d_padded = None
+
+            # 4) Call your fused kernel (must import it from self-attn, or define in same file)
             out_2d_padded = fused_self_attn_for_SD_small_head_size(
-                q_2d_padded,
-                k_2d_padded,
-                v_2d_padded,
+                q_ref=q_2d_padded,
+                k_ref=k_2d_padded,
+                v_ref=v_2d_padded,
                 use_causal_mask=use_causal_mask,
-                mixed_precision=True,
+                mixed_precision=True
             )
-            # out_2d_padded is shape (padded_len, d_head)
+            # shape = [padded_len, d_head]
 
-            # 4) Slice out only the first seq_q rows => final shape (seq_q, d_head)
+            # 5) Slice back to (seq_q, d_head)
             out_2d = out_2d_padded[:seq_q]
-            attn_out[b, h] = out_2d.to(dtype=dtype)
+            attn_out[b, h] = out_2d
 
     return attn_out
+
+# def compute_for_token_gen_nki(
+#     Q,           # (batch, heads, seq_q, d_head)
+#     K_prev,      # (batch, heads, seq_prev, d_head)
+#     K_active,    # (batch, heads, seq_active, d_head)
+#     V_prev,      # (batch, heads, seq_prev, d_head)
+#     V_active,    # (batch, heads, seq_active, d_head)
+#     attention_mask=None,  # bool or None
+#     use_causal_mask=False
+# ):
+#     """
+#     Use the fused_self_attn_for_SD_small_head_size kernel, 
+#     forcing the sequence dimension up to a multiple of 128 so 
+#     that the kernel's loops run.
+#     """
+#     device = Q.device
+#     dtype = Q.dtype
+#     B, H, seq_q, d_head = Q.shape
+
+#     # Concatenate old & new keys/values:
+#     K_cat = torch.cat([K_prev, K_active], dim=2)  # shape = (B,H, seq_k, d_head)
+#     V_cat = torch.cat([V_prev, V_active], dim=2)
+#     seq_k = K_cat.shape[2]
+
+#     # We'll produce [B, H, seq_q, d_head] as our final output
+#     attn_out = torch.empty_like(Q)
+
+#     # 1) Determine the final padded_len so seq_q and seq_k 
+#     #    become the same multiple-of-128 dimension:
+#     padded_len = max(seq_q, seq_k)
+
+#     # If you want a minimum of 128:
+#     if padded_len < 128:
+#         padded_len = 128
+
+#     # Now round up to the nearest multiple of 128:
+#     if padded_len % 128 != 0:
+#         padded_len = ((padded_len + 127) // 128) * 128
+
+#     for b in range(B):
+#         for h in range(H):
+#             # Extract Q, K, V slices for this (b,h)
+#             q_2d = Q[b, h]            # shape (seq_q, d_head)
+#             k_2d = K_cat[b, h]        # shape (seq_k, d_head)
+#             v_2d = V_cat[b, h]        # shape (seq_k, d_head)
+
+#             # 2) Pad Q, K, V so each becomes (padded_len, d_head)
+#             q_2d_padded = F.pad(
+#                 q_2d, (0, 0, 0, padded_len - seq_q)
+#             ) if seq_q < padded_len else q_2d
+
+#             k_2d_padded = F.pad(
+#                 k_2d, (0, 0, 0, padded_len - seq_k)
+#             ) if seq_k < padded_len else k_2d
+
+#             v_2d_padded = F.pad(
+#                 v_2d, (0, 0, 0, padded_len - seq_k)
+#             ) if seq_k < padded_len else v_2d
+
+#             # 3) Call the fused kernel with the padded shapes
+#             out_2d_padded = fused_self_attn_for_SD_small_head_size(
+#                 q_2d_padded,
+#                 k_2d_padded,
+#                 v_2d_padded,
+#                 use_causal_mask=use_causal_mask,
+#                 mixed_precision=True,
+#             )
+#             # out_2d_padded is shape (padded_len, d_head)
+
+#             # 4) Slice out only the first seq_q rows => final shape (seq_q, d_head)
+#             out_2d = out_2d_padded[:seq_q]
+#             attn_out[b, h] = out_2d.to(dtype=dtype)
+
+#     return attn_out
 
 ################################################################################
 # 4) TEST FUNCTION:
@@ -527,7 +905,7 @@ def test_compute_for_token_gen():
     )
 
     # 4) Run NKI-based kernel call (now all on XLA device)
-    out_nki = compute_for_token_gen_nki(
+    out_nki = compute_for_token_gen(
         Q, K_prev, K_active, V_prev, V_active,
         attention_mask=None,
         use_causal_mask=True
