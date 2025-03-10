@@ -95,7 +95,12 @@ import neuronxcc.nki.isa as nisa
 import os
 from torch_xla.core import xla_model as xm
 
+try:
+    from neuronxcc.nki._private_kernels.attention import attention_isa_kernel  # noqa: E402
+except ImportError:
+    from neuronxcc.nki.kernels.attention import attention_isa_kernel  # noqa: E402
 
+_flash_fwd_call = nki_jit()(attention_isa_kernel)
 SIMPLE_PROFILE = False
 _LLAMA_MODULE_MAP = {}
 
@@ -686,6 +691,31 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, eps):
 
     return out_tensor
 
+@nki.jit
+def softmax_kernel(x):
+    print(x.shape)
+    input = nl.load(x[:, :])
+    res_psum = nl.zeros(input.shape, nl.float32, buffer=nl.psum)  # 存储结果
+    res_psum = nl.softmax(input, axis=-1, dtype=nl.float32)
+    result = nl.ndarray(input.shape, dtype=x.dtype, buffer=nl.shared_hbm)
+    nl.store(result[:, :], value=res_psum)
+    return result
+
+def custom_softmax_large_tensor(tensor, max_shape=(128, 512)):
+    B, C, H, W = tensor.shape   # 1,16,64,128
+    reshaped = tensor.view(-1, W)  # 1024, 128
+
+    result_chunks = []
+    max_batch = max_shape[0]
+    for i in range(0, reshaped.shape[0], max_batch):
+        chunk = reshaped[i:i+max_batch]  # 每次处理不超过256个向量
+        # 假设 softmax_kernel 接口支持传入 (<=256,128)
+        chunk_result = softmax_kernel(chunk)  # 调用你的接口
+        result_chunks.append(chunk_result)
+
+    result = torch.cat(result_chunks, dim=0)
+    result = result.view(B, C, H, W)  # 还原原始形状
+    return result
 
 class CustomRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6, nki_enabled=False):
@@ -1450,24 +1480,115 @@ class NeuronLlamaAttention(NeuronAttentionBase):
                 # We include it here for compatibility with other scaling types.
                 self.rotary_emb = LlamaRotaryEmbedding(self.config)
 
-    def scaled_qk(self, Q, K, attention_mask):
-        ## 可以操作
-        ## [32,64] [64,32]
-        bs, head, sequence, dimension = Q.size()
-        _, head_k, sequence_k, dimension_k = K.size()
-        result = torch.zeros((bs, head, sequence, sequence_k), device = Q.device, dtype=Q.dtype)
-        for i in range(bs):
-            for j in range(head):
-                temp_q = Q[i, j, :, :]
-                temp_k = (K.transpose(2, 3))[i, j, :, :]
-                temp = block_matmul(temp_q, temp_k)
-                result[i, j, :, :] = temp
-        QK = result / math.sqrt(self.head_dim)
+    # def scaled_qk(self, Q, K, attention_mask):
+    #     ## 可以操作
+    #     ## [32,64] [64,32]
+    #     bs, head, sequence, dimension = Q.size()
+    #     _, head_k, sequence_k, dimension_k = K.size()
+    #     result = torch.zeros((bs, head, sequence, sequence_k), device = Q.device, dtype=Q.dtype)
+    #     for i in range(bs):
+    #         for j in range(head):
+    #             temp_q = Q[i, j, :, :]
+    #             temp_k = (K.transpose(2, 3))[i, j, :, :]
+    #             temp = block_matmul(temp_q, temp_k)
+    #             result[i, j, :, :] = temp
+    #     QK = result / math.sqrt(self.head_dim)
 
-        # QK = torch.matmul(Q, K.transpose(2, 3)) / math.sqrt(self.head_dim)
-        QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
-        return QK
+    #     # QK = torch.matmul(Q, K.transpose(2, 3)) / math.sqrt(self.head_dim)
+    #     QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
+    #     return QK
     
+    def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask) -> Tensor:
+        """attention computation at prefilling (context encoding) phase"""
+        K_active = repeat_kv(K, self.num_key_value_groups)
+        V_active = repeat_kv(V, self.num_key_value_groups)
+
+        flash_attn_strategy = self.get_flash_attention_strategy(q_len)
+        # logger.debug(f"Flash attention strategy: {flash_attn_strategy}")
+
+        if flash_attn_strategy != FlashAttentionStrategy.NONE:
+            # logger.debug(f"ATTN kernel: logical_neuron_cores={self.logical_neuron_cores}")
+            # if we are using left padding, then the bzs needs be 1 (otherwise we get wrong result
+            # because flash attention does not use attention_mask). In practice, we use right
+            # padding so this is unlikely to cause issues
+            assert self.padding_side == "right" or bsz == 1
+
+            # original shape of q, k, v is BHSD, and expected output is also BHSD.
+            # logger.debug(f"Using flash_fwd for Q.shape={Q.shape}")
+            # make sure to cast inputs to torch_dtype (this is needed because the downcast to bf16
+            # might happen after the kernel hlo creation step). Also convert shapes as expected by the kernel.
+
+            # original Q shape: batch, num_heads, seqlen, d_head
+            Q = (
+                Q.permute(0, 1, 3, 2)  # after permute: batch, num_heads, d_head, seqlen
+                .reshape((bsz * self.num_heads, self.head_dim, q_len))
+                .to(self.torch_dtype)
+            )
+            Q = Q / math.sqrt(self.head_dim)
+            K_active = (
+                K_active.permute(0, 1, 3, 2)
+                .reshape((bsz * self.num_heads, self.head_dim, q_len))
+                .to(self.torch_dtype)
+            )
+            V_active = V_active.reshape((bsz * self.num_heads, q_len, self.head_dim)).to(
+                self.torch_dtype
+            )
+            # shape: (B*H)DS
+            attn_output = torch.zeros(
+                bsz * self.num_heads, self.head_dim, q_len, dtype=Q.dtype, device=Q.device
+            )
+
+            # logger.debug("Input parameter shapes")
+            # logger.debug(f"Q input shape {Q.shape}")
+            # logger.debug(f"K input shape {K_active.shape}")
+            # logger.debug(f"V input shape {V_active.shape}")
+            # logger.debug(f"Attn output shape {attn_output.shape}")
+
+            if flash_attn_strategy == FlashAttentionStrategy.SHARDED_KERNEL:
+                grid = (vnc(self.logical_neuron_cores),)
+
+                _flash_fwd_call[grid](
+                    Q,
+                    K_active,
+                    V_active,
+                    1.0,
+                    attn_output,
+                    kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap",
+                )
+            elif flash_attn_strategy == FlashAttentionStrategy.UNSHARDED_KERNEL:
+                _flash_fwd_call(
+                    Q,
+                    K_active,
+                    V_active,
+                    1.0,
+                    attn_output,
+                    kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap",
+                )
+            else:
+                raise ValueError(f"Invalid flash attention strategy: {flash_attn_strategy}")
+
+            # shape: BHDS
+            attn_output = attn_output.reshape((bsz, self.num_heads, self.head_dim, q_len))
+            # logger.debug(f"Attn output after reshape {attn_output.shape}")
+        else:
+            # logger.debug("ATTN: native compiler")
+            # logger.debug(f"Not using flash_fwd for Q.shape={Q.shape}")
+            active_scores = self.scaled_qk(Q, K_active, attention_mask)
+            
+            print("active_scores", active_scores.size())
+            
+            if active_scores.size()[-1] <= 512 :
+                Q_type = Q.dtype
+                active_scores = custom_softmax_large_tensor(active_scores)
+                active_scores = active_scores.to(Q_type)
+            else:
+                active_scores = nn.functional.softmax(active_scores, dim=-1, dtype=torch.float32).to(
+                    Q.dtype
+                )
+            attn_output = torch.matmul(active_scores, V_active)
+        return attn_output, flash_attn_strategy
+
+
     def compute_for_token_gen(
         self, Q, K, V, position_ids, past_key_value, attention_mask, active_mask
     ) -> Tensor:
