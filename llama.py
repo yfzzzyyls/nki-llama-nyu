@@ -656,7 +656,6 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, eps):
         for i in range(math.ceil(a_tensor.shape[1]/128)):
             # Load input data from external memory to on-chip memory
             a_tile = nl.zeros([128, a_tensor.shape[2]], a_tensor.dtype)
-            # print("a tensor shape2", a_tensor.shape[2])
             a_tile[...] = nl.load(a_tensor[b, i * 128 + ix, iy], mask=(i * 128 + ix < num_rows))
 
             # Compute element-wise square of a_tensor
@@ -881,7 +880,6 @@ class NeuronLlamaMLP(nn.Module):
                 )
 
             else:
-                # print("initialize columnxxx")
                 self.gate_proj = ColumnParallelLinear(
                     self.hidden_size,
                     self.intermediate_size,
@@ -1401,12 +1399,10 @@ class NeuronLlamaAttention(NeuronAttentionBase):
             self.tp_degree = 1
 
         self.fused_qkv = config.neuron_config.fused_qkv
-        # print("fused_qkv:", self.fused_qkv)
         self.fused_qkv = True
         self.clip_qkv = None
 
         self.sequence_parallel_enabled = self.neuron_config.sequence_parallel_enabled
-        # print("sequence_parallel_enabled:", self.sequence_parallel_enabled)
         # self.sequence_parallel_enabled = True
         self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
         # logger.debug(
@@ -1459,16 +1455,11 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         ## [32,64] [64,32]
         bs, head, sequence, dimension = Q.size()
         _, head_k, sequence_k, dimension_k = K.size()
-        # print("size:", sequence)
-        # print("size2:", sequence_k)
         result = torch.zeros((bs, head, sequence, sequence_k), device = Q.device, dtype=Q.dtype)
-        # print("Q.type:", Q.dtype)
         for i in range(bs):
             for j in range(head):
                 temp_q = Q[i, j, :, :]
                 temp_k = (K.transpose(2, 3))[i, j, :, :]
-                # print("temp_q", temp_q.size())
-                # print("temp_k", temp_k.size())
                 temp = block_matmul(temp_q, temp_k)
                 result[i, j, :, :] = temp
         QK = result / math.sqrt(self.head_dim)
@@ -1483,8 +1474,6 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         """attention computation at token generation phase"""
         is_speculation = position_ids.shape[-1] > 1
         
-        # print("USE SUBCLASS TOKEN GEN: is_spec is", is_speculation)
-
         # Attention computation: softmax((Q.K/√dkv) + mask).V
         # i. prior (cached) KV
         K_prior = past_key_value[0]
@@ -1529,8 +1518,6 @@ class NeuronLlamaAttention(NeuronAttentionBase):
         rmsnorm=None,
     ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
         """Implements each layer's forward pass for the attention block."""
-
-        # print("USE SUBCLASS FORWARD")
 
         bsz, q_len, _ = hidden_states.size()
         if self.sequence_parallel_enabled:
@@ -1740,10 +1727,6 @@ class NeuronLlamaDecoderLayer(nn.Module):
         if (not self.qkv_kernel_enabled or self.sequence_parallel_enabled) and self.input_layernorm:
             hidden_states = self.input_layernorm(hidden_states)
 
-        # if SIMPLE_PROFILE:
-        #     rmsnorm_self_attn_end = time.time()
-        #     print(f"Layer {self.layer_index}: rms norm in Self-attention time = {rmsnorm_self_attn_end - rmsnorm_self_attn_start:.6f} s")
-
         # Self Attention
 
         hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
@@ -1906,13 +1889,11 @@ class NeuronLlamaModel(NeuronBaseModel):
         self.medusa_speculation_length = config.neuron_config.medusa_speculation_length
 
         if self.is_medusa:
-            print("EVER is_medusa")
             if parallel_state.model_parallel_is_initialized():
                 medusa_head_cls = ColumnParallelLinear
             else:
                 medusa_head_cls = nn.Linear
             for i in range(self.num_medusa_heads):
-                print("EVER called ResBlock")
                 medusa_head = nn.Sequential(
                     *([ResBlock(config.hidden_size)] * 1),
                     medusa_head_cls(
