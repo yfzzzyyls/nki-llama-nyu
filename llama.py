@@ -1235,9 +1235,6 @@ class NeuronLlamaMLP(nn.Module):
         # Ntile = NDIM // 512
         # Ktile = KDIM // 128 
 
-        # # input transpose operation causes the biggest drop in latency
-
-        # # output_padded = nki_matmul_fully_optimized_(x_flat_padded_T, gate_weight_T, Mtile, Ntile, Ktile)
         # output_padded = nki_matmul_fully_optimized_spmd_[nl.nc(2)](x_flat_padded_T, gate_weight_T, Mtile, Ntile, Ktile, 2)        
         # output_flat = output_padded[:M_orig, :]
         # gate_proj_output = output_flat.view(B, N, -1)
@@ -1497,7 +1494,130 @@ class NeuronLlamaAttention(NeuronAttentionBase):
     #     # QK = torch.matmul(Q, K.transpose(2, 3)) / math.sqrt(self.head_dim)
     #     QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
     #     return QK
-    
+
+    def scaled_qk(self, Q, K, attention_mask, chunk_size=256):
+        """
+        Fix the neuronx-cc compile error #70 by CHUNKING the (S x S) dimension.
+        Each chunk is smaller => the kernel is less likely to exceed compiler limits.
+        
+        Q,K shape: [B, H, S, D]
+        Returns shape: [B, H, S, S]
+        
+        We'll only flatten (B,H)->BH and chunk the 'N' dimension = S.
+        """
+
+        # Q, K: [B, H, S, D]
+        B, H, S, D = Q.size()
+        BH = B * H  # flatten these two
+
+        # Flatten to [BH, S, D]
+        Q_3d = Q.view(BH, S, D)
+        K_3d = K.view(BH, S, D)
+
+        # Our final result is [BH, S, S], then reshape to [B, H, S, S]
+        QK_3d = torch.empty((BH, S, S), dtype=Q.dtype, device=Q.device)
+
+        for i in range(BH):
+            # Sub-tensors shape (S, D)
+            q_i_2d = Q_3d[i]  # [S, D]
+            k_i_2d = K_3d[i]  # [S, D]
+
+            # We'll interpret q_i_2d^T => (D, S) for (K=D, M=S)
+            # and k_i_2d^T => (D, S) for (K=D, N=S).
+            lhsT = q_i_2d.T  # shape (D, S)
+            rhs  = k_i_2d.T  # shape (D, S)
+
+            # We want out_i => shape (S, S). We'll build it chunk by chunk along the N dimension.
+            out_i = torch.zeros((S, S), dtype=Q.dtype, device=Q.device)
+
+            # We'll define tile-block factors. Because each chunk is only up to `chunk_size`, we reduce ephemeral usage
+            TILES_IN_BLOCK_M = max(1, S // 128)       # a guess
+            TILES_IN_BLOCK_K = max(1, D // 128)       # a guess
+            # We let TILES_IN_BLOCK_N be smaller, e.g. S//(512) might be big => we chunk anyway
+            # We'll just set it to 1 or 2 for safety
+            TILES_IN_BLOCK_N = 1
+
+            # We may need a helper to pad if S or D not multiples of block sizes
+            def pad_2d(tensor_2d, new_k, new_m):
+                cur_k, cur_m = tensor_2d.shape
+                if (cur_k == new_k) and (cur_m == new_m):
+                    return tensor_2d
+                padded = torch.zeros((new_k, new_m), dtype=tensor_2d.dtype, device=tensor_2d.device)
+                padded[:cur_k, :cur_m] = tensor_2d
+                return padded
+
+            TILE_M = nl.tile_size.gemm_stationary_fmax  # typically 128
+            TILE_K = nl.tile_size.pmax                  # typically 128
+            TILE_N = nl.tile_size.gemm_moving_fmax      # typically 512
+
+            BLOCK_M = TILE_M * TILES_IN_BLOCK_M
+            BLOCK_K = TILE_K * TILES_IN_BLOCK_K
+            # We'll set BLOCK_N = TILE_N*TILES_IN_BLOCK_N, but we're also chunking N dimension => smaller sub-blocks
+
+            # We'll do a loop over the N dimension in steps of `chunk_size`
+            # Each chunk => shape (S, chunk) in the final out_i
+            for start_col in range(0, S, chunk_size):
+                end_col = min(start_col + chunk_size, S)
+                chunk_width = end_col - start_col
+
+                # 1) We'll define a sub-rhs => shape (D, chunk_width)
+                rhs_sub = rhs[:, start_col:end_col]  # shape (D, chunk_width)
+
+                # 2) We must ensure block dimension is a multiple for M, N, K
+                # so let's pad if needed.
+                # M = S, N = chunk_width, K = D
+                M_pad = math.ceil(S / BLOCK_M) * BLOCK_M
+                N_pad = math.ceil(chunk_width / 512) * 512  # or use tile*N
+                # We'll do a small TILES_IN_BLOCK_N? We'll guess chunk_width // 512 + 1, etc. But let's do a direct pad.
+                N_pad = max(N_pad, BLOCK_N := nl.tile_size.gemm_moving_fmax)  # 512 is typical
+
+                # If chunk_width is < 512, we definitely do some pad:
+                # or do chunk_width // 512 => 0 => TILES_IN_BLOCK_N=1 => BLOCK_N=512 => we do some pad
+
+                # K_pad = ...
+                # We'll do the same for D => K dimension
+                K_pad = math.ceil(D / BLOCK_K) * BLOCK_K
+
+                lhsT_sub = pad_2d(lhsT, K_pad, M_pad)     # (K_pad, M_pad)
+                rhs_sub2 = pad_2d(rhs_sub, K_pad, N_pad)  # (K_pad, N_pad)
+
+                # 3) Now do the kernel call
+                # we choose TILES_IN_BLOCK_M etc. again for the sub-block
+                # to ensure M_pad % (128 * TILES_IN_BLOCK_M) == 0, etc.
+                # We'll pick small tile factors:
+                local_TM = max(1, M_pad // 128)
+                local_TK = max(1, K_pad // 128)
+                # local_TN = ?
+
+                # Because chunk_width might be small, we do local_TN = 1
+                local_TN = 1
+
+                partial_padded = nki_matmul_fully_optimized_(
+                    lhsT_sub,
+                    rhs_sub2,
+                    TILES_IN_BLOCK_M=local_TM,
+                    TILES_IN_BLOCK_N=local_TN,
+                    TILES_IN_BLOCK_K=local_TK
+                )
+                # shape => (M_pad, N_pad)
+
+                # Slice off padding => shape => (S, chunk_width)
+                partial_out = partial_padded[:S, :chunk_width]
+
+                # 4) Accumulate partial_out into the final out_i in columns [start_col..end_col)
+                out_i[:, start_col:end_col] = partial_out
+
+            # store out_i => QK_3d[i]
+            QK_3d[i] = out_i
+
+        # Now shape = [BH, S, S]. Reshape => [B, H, S, S]
+        QK_4d = QK_3d.view(B, H, S, S)
+
+        # scale & mask
+        QK_4d = QK_4d / math.sqrt(D)
+        QK_4d = torch.where(attention_mask, QK_4d, torch.finfo(QK_4d.dtype).min)
+        return QK_4d
+  
     def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask) -> Tensor:
         """attention computation at prefilling (context encoding) phase"""
         K_active = repeat_kv(K, self.num_key_value_groups)
